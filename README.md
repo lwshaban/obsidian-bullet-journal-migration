@@ -1,90 +1,347 @@
-# Obsidian Sample Plugin
+# Bujo for Obsidian
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+Automate your bullet journal workflow in Obsidian with powerful task migration markers and automated review generation.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+> **Note:** This plugin was created independently by a fan of the Bullet Journal method and is not affiliated with or endorsed by the official Bullet Journal system. To learn about and support the original creator and methodology, please visit: [bulletjournal.com](https://bulletjournal.com/pages/book)
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+## Overview
 
-## First time developing plugins?
+This plugin implements a complete bullet journal migration system for Obsidian, allowing you to:
+- **Migrate tasks** between daily, weekly, and monthly notes using simple markers
+- **Generate reviews** automatically from incomplete tasks
+- **Schedule tasks** to specific days, weeks, or months
+- **Track task types** (events, appointments, information points)
+- **Prioritize tasks** with descriptors (P1, P2, P3, Blocked, InProgress, Highlight)
 
-Quick starting guide for new plugin devs:
+## Required Folder Structure
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `main.ts` to `main.js`.
-- Make changes to `main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+The plugin expects the following folder structure in your vault:
 
-## Releasing new releases
-
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
-
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
-
-## Adding your plugin to the community plugin list
-
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
-
-## How to use
-
-- Clone this repo.
-- Make sure your NodeJS is at least v16 (`node --version`).
-- `npm i` or `yarn` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
-
-## Manually installing the plugin
-
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
-
-## Improve code quality with eslint
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code. 
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
-
-## Funding URL
-
-You can include funding URLs where people who use your plugin can financially support it.
-
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
-
-```json
-{
-    "fundingUrl": "https://buymeacoffee.com"
-}
+```
+Journal/
+├── 001 Daily Notes/        # Daily notes (YYYY-MM-DD.md)
+├── 002 Weekly Notes/       # Weekly notes (YYYY-Www.md)
+├── 003 Monthly Notes/      # Monthly notes (YYYY-MM.md)
+├── 004 Future Log/         # Future log (Future.md)
+├── 005 Weekly Reviews/     # Generated weekly reviews
+├── 006 Monthly Reviews/    # Generated monthly reviews
+└── 007 Global Reviews/     # Generated global reviews
 ```
 
-If you have multiple URLs, you can also do:
+## Migration Markers
 
-```json
-{
-    "fundingUrl": {
-        "Buy Me a Coffee": "https://buymeacoffee.com",
-        "GitHub Sponsor": "https://github.com/sponsors",
-        "Patreon": "https://www.patreon.com/"
-    }
-}
+### Basic Migration Markers
+
+Add these markers as the checkbox in your task notes:
+
+| Marker | Description | Example |
+|--------|-------------|---------|
+| `[>w]` | Migrate to next week | `- [>w] Task` |
+| `[>m]` | Migrate to next month | `- [>m] Task` |
+| `[>>]` | Migrate to tomorrow | `- [>>] Task` |
+| `[>fut]` | Migrate to future log | `- [>fut] Task` |
+| `[<w]` | Migrate to current week | `- [<w] Task` |
+| `[>:]` or `[>\|]` | Migrate to today | `- [>:] Task` |
+
+### Specific Day/Week Markers
+
+| Marker | Description |
+|--------|-------------|
+| `[>mon]`, `[>tue]`, `[>wed]`, `[>thu]`, `[>fri]`, `[>sat]`, `[>sun]` | Next occurrence of that day |
+| `[>w1]`, `[>w2]`, `[>w3]`, `[>w4]` | 1-4 weeks from now |
+| `[>m3w]` | 3rd week of next month |
+
+### Specific Month Markers
+
+| Marker | Description |
+|--------|-------------|
+| `[>jan]`, `[>feb]`, `[>mar]`, etc. | Next occurrence of that month |
+
+### Task Type Markers (Destination Checkbox)
+
+Specify what type of checkbox the destination task should have. The content in `{...}` becomes the destination checkbox:
+
+| Type | Description | Marker Example | Destination |
+|------|-------------|----------------|-------------|
+| `{o}` | Event (one-time occurrence) | `- [>fri{o}] Task` | `- [o] Task` |
+| `{a}` | Appointment (scheduled time) | `- [>mon{a}] Task` | `- [a] Task` |
+| `{.}` | Information point (plain list) | `- [>w{.}] Task` | `- Task` |
+| `{custom}` | Any custom checkbox type | `- [>w{=}] Task` | `- [=] Task` |
+
+### Mark Without Migrating
+
+| Marker | Description |
+|--------|-------------|
+| `[>skip]` or `[>x]` | Mark as migrated without actually migrating |
+| `[<]` | Mark as already scheduled |
+| `[>-]` | Mark as migrated without migrating |
+
+### New Task Markers
+
+Create new tasks that don't require a source:
+
+| Marker | Description |
+|--------|-------------|
+| `[+>w]` | Create new task for next week |
+| `[+>m]` | Create new task for next month |
+| `[+>tue]` | Create new task for next Tuesday |
+| `[+>fri{o}]` | Create event for Friday |
+
+### Information Point Markers
+
+Migrate items as plain list items (no checkboxes):
+
+| Marker | Description |
+|--------|-------------|
+| `[->w]` | Migrate as info point to next week |
+| `[->m]` | Migrate as info point to next month |
+| `[->fri]` | Migrate as info point to Friday |
+
+## Commands
+
+### Process Daily Note
+**Command:** `Process Daily Note`
+
+Processes the currently open daily note, migrating all tasks with migration markers to their destinations.
+
+### Generate Weekly Review
+**Command:** `Generate Weekly Review`
+
+Creates a weekly review document with all incomplete tasks from the current week's daily notes and the weekly note.
+
+### Process Weekly Review
+**Command:** `Process Weekly Review`
+
+Processes the currently open weekly review, migrating all marked tasks.
+
+### Schedule Weekly Plan
+**Command:** `Schedule Weekly Plan`
+
+Processes a weekly plan note, scheduling tasks to specific days of the week.
+
+### Generate Monthly Review
+**Command:** `Generate Monthly Review`
+
+Creates a monthly review document with all incomplete tasks from the current month's daily notes, weekly notes, and the monthly note.
+
+### Process Monthly Review
+**Command:** `Process Monthly Review`
+
+Processes the currently open monthly review, migrating all marked tasks.
+
+### Schedule Monthly Plan
+**Command:** `Schedule Monthly Plan`
+
+Processes a monthly plan note, scheduling tasks to specific weeks or days.
+
+### Generate Global Review
+**Command:** `Generate Global Review`
+
+Creates a comprehensive global review with incomplete tasks from all periods.
+
+### Process Global Review
+**Command:** `Process Global Review`
+
+Processes the global review, migrating all marked tasks.
+
+## Workflow Examples
+
+### Daily Workflow
+
+1. Open today's daily note
+2. Add migration markers as checkboxes for incomplete tasks:
+   ```markdown
+   - [>mon] Call dentist
+   - [>>] Review presentation
+   - [>m{o}] Plan vacation event
+   ```
+3. Run "Process Daily Note" command
+4. Tasks are automatically migrated to their destinations
+
+### Weekly Review Workflow
+
+1. Run "Generate Weekly Review" command
+2. Review the generated list of incomplete tasks
+3. Add migration markers as checkboxes:
+   ```markdown
+   - [>w{a}] Finish project proposal appointment
+   - [>fut] Read article
+   - [<] Update documentation
+   ```
+4. Run "Process Weekly Review" command
+5. Tasks are migrated accordingly
+
+### Monthly Planning Workflow
+
+1. Run "Generate Monthly Review" command
+2. Review all incomplete tasks from the month
+3. Add markers to schedule tasks for next month
+4. Run "Process Monthly Review" command
+
+## Task Migration Behavior
+
+- **Completed tasks** (`[x]`): Ignored, stay in source, not migrated
+- **Cancelled tasks** (`[-]`): Ignored, stay in source, not migrated
+- **Tasks with migration markers**: Migrated to destination and marked as `[>]` or `[<]` in source
+- **Child tasks**: Only **incomplete** children automatically migrate with parent
+  - Completed children (`[x]`) stay in source
+  - Cancelled children (`[-]`) stay in source
+  - Children can override parent's destination with their own marker
+- **Information points**: Created as plain list items without checkboxes
+- **Deduplication**: Tasks with identical text (normalized) are not added if they already exist in the destination
+  - Prevents duplicate entries when migrating the same task multiple times
+  - Comparison is case-insensitive and ignores extra whitespace
+  - Example: Migrating "Call dentist" to Friday on Monday, Tuesday, and Wednesday results in only one entry in Friday's note
+
+### Child Task Migration Example
+
+**Before migration:**
+```markdown
+- [>w] Plan vacation
+  - [ ] Research destinations
+  - [x] Book time off work
+  - [ ] Check passport expiration
+  - [>m] Book flights (has own marker)
 ```
 
-## API Documentation
+**After migration:**
+- **Source file** shows:
+```markdown
+- [>] Plan vacation
+  - [>] Research destinations
+  - [x] Book time off work (stayed in source - completed)
+  - [>] Check passport expiration
+  - [>] Book flights
+```
 
-See https://docs.obsidian.md
+- **Next week's file** shows:
+```markdown
+- [ ] Plan vacation
+  - [ ] Research destinations
+  - [ ] Check passport expiration
+```
+
+- **Next month's file** shows:
+```markdown
+- [ ] Book flights
+```
+
+### Complex Example: All Child Types
+
+**Before migration:**
+```markdown
+- [>w] Active project
+  - [ ] Review documentation
+  - [x] Initial setup (completed)
+  - Meeting notes from yesterday (plain info point)
+  - [>mon] Follow-up call (child with own marker)
+  - [-] Old approach (cancelled)
+
+- [x] Completed project (no migration marker possible)
+  - [ ] Outstanding task
+  - Final notes
+```
+
+**After migration:**
+- **Source file** shows:
+```markdown
+- [>] Active project
+  - [>] Review documentation
+  - [x] Initial setup (stayed - completed)
+  - Meeting notes from yesterday (stayed - reference material)
+  - [>] Follow-up call
+  - [-] Old approach (stayed - cancelled)
+
+- [x] Completed project (unchanged - no migration)
+  - [ ] Outstanding task (stayed with completed parent)
+  - Final notes (stayed with completed parent)
+```
+
+- **Next week's file** shows:
+```markdown
+- [ ] Active project
+  - [ ] Review documentation
+  - Meeting notes from yesterday (duplicated as reference)
+```
+
+- **Next Monday's file** shows:
+```markdown
+- [ ] Follow-up call
+```
+
+### Deduplication Example
+
+**Monday's note:**
+```markdown
+- [>fri] Call dentist
+```
+
+**Tuesday's note:**
+```markdown
+- [>fri] Call dentist
+```
+
+**Wednesday's note:**
+```markdown
+- [>fri] Call dentist
+```
+
+**Result: Friday's note only has ONE entry:**
+```markdown
+- [ ] Call dentist
+```
+
+The plugin detected that "Call dentist" already exists in Friday's note, so it skipped the duplicate migrations from Tuesday and Wednesday.
+
+**Note:** Deduplication uses normalized text comparison (case-insensitive, ignores extra whitespace and wiki link brackets). Tasks with different wording are treated as separate tasks.
+
+## Installation
+
+### Via BRAT (Beta Reviewers Auto-update Tester)
+
+1. Install the BRAT plugin from Obsidian Community Plugins
+2. Open command palette and run "BRAT: Add a beta plugin for testing"
+3. Enter: `lwshaban/obsidian-bujo-migration`
+4. Enable the plugin in Settings → Community Plugins
+
+### Manual Installation
+
+1. Download `main.js`, `manifest.json`, and `styles.css` from the latest release
+2. Create a folder in your vault: `.obsidian/plugins/obsidian-bujo-migration/`
+3. Copy the downloaded files into this folder
+4. Enable the plugin in Settings → Community Plugins
+
+## Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/lwshaban/obsidian-bujo-migration.git
+
+# Install dependencies
+npm install
+
+# Build the plugin
+npm run build
+
+# Set up symlinks for development
+npm run setup
+# (Edit dev-setup.sh first to set your vault path)
+
+# Start development with auto-rebuild
+npm run dev
+```
+
+## Support
+
+If you find this plugin helpful, consider:
+- ⭐ Starring the repository
+- 🐛 Reporting bugs via GitHub issues
+- 💡 Suggesting features
+
+## License
+
+MIT License - see LICENSE file for details
+
+## Author
+
+Lawrence Shaban ([@lwshaban](https://github.com/lwshaban))
