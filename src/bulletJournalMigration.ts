@@ -40,14 +40,16 @@ export class BulletJournalMigration {
         // Support month week: m3w (3rd week of month)
         // Support today marker: [>:] or [>|]
         // Support current period markers: [>:w]/[>|w], [>:m]/[>|m], [>:y]/[>|y] OR legacy [<w], [<m], [<y]
-        // Support checkbox content: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
+        // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
+        // Note: (...) for source is ignored for new tasks (no source to update)
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\{([^}]+)\})?\]/i);
+        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i);
         if (newTaskMatch && newTaskMatch[1]) {
-            const checkboxContent = newTaskMatch[2] || null;
+            const destCheckboxContent = newTaskMatch[3] || null;  // {...} for destination
             return {
                 marker: newTaskMatch[1].toLowerCase(),
-                type: checkboxContent,
+                type: destCheckboxContent,
+                sourceType: null,  // New tasks don't have source
                 descriptor: null,
                 originalMarker: newTaskMatch[0],
                 isNewTask: true,
@@ -130,20 +132,24 @@ export class BulletJournalMigration {
         // Support month week: m3w (3rd week of month)
         // Support today marker: [>:] or [>|]
         // Support current period markers: [>:w]/[>|w], [>:m]/[>|m], [>:y]/[>|y] OR legacy [<w], [<m], [<y]
-        // Support checkbox content: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
+        // Support source checkbox: (/), (=), etc. - becomes source checkbox after migration
+        // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
+        // Example: [>w(/){=}] - source becomes [/], destination becomes [=]
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\{([^}]+)\})?\]/i;
+        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i;
         const match = line.match(markerRegex);
 
         if (!match || !match[1]) {
             return null;
         }
 
-        const checkboxContent = match[2] || null;
+        const sourceCheckboxContent = match[2] || null;  // (...) for source
+        const destCheckboxContent = match[3] || null;    // {...} for destination
 
         return {
             marker: match[1].toLowerCase(),
-            type: checkboxContent,
+            type: destCheckboxContent,
+            sourceType: sourceCheckboxContent,
             descriptor: null,
             originalMarker: match[0],
         };
@@ -161,9 +167,15 @@ export class BulletJournalMigration {
      * Get checkbox marker for original task after migration
      * Includes icon for events/appointments: :BujoEvent: or :BujoAppointment:
      */
-    getOriginalMarker(marker: string, type: TaskType = null): string {
+    getOriginalMarker(marker: string, type: TaskType = null, sourceType: TaskType = null): string {
         // Return just the checkbox content (not full brackets)
         // Used for replacing checkbox: [>mon] → [>] or [<]
+
+        // If sourceType is specified via (...), use that for source marker
+        // Example: [>w(/)] - source becomes [/]
+        if (sourceType && sourceType !== '.' && sourceType.trim() !== '') {
+            return sourceType;
+        }
         return this.isScheduledMarker(marker) ? '<' : '>';
     }
 
@@ -1579,7 +1591,7 @@ export class BulletJournalMigration {
             const parsed = this.parseMigrationMarker(taskLine);
             if (!parsed) return { success: false, error: 'No migration marker found' };
 
-            const { marker, type, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
+            const { marker, type, sourceType, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
 
             // Auto-collect children from source file if none provided
             if (childTasks.length === 0 && !isNewTask) {
@@ -1838,11 +1850,14 @@ export class BulletJournalMigration {
                 const childIndent = childIndentMatch ? childIndentMatch[0] : '';
 
                 // Calculate relative indent from parent (maintain hierarchy)
+                // Preserve original indentation style (tabs vs spaces) by extracting
+                // the actual characters used for the relative indent
                 const parentIndentLength = indent.length;
-                const childIndentLength = childIndent.length;
-                const childRelativeIndent = childIndentLength - parentIndentLength;
-                // Destination child indent should maintain relative position to parent
-                const destChildIndent = ' '.repeat(parentIndentLength + Math.max(0, childRelativeIndent));
+                // Extract the portion of child indent that goes beyond parent indent
+                // This preserves tabs/spaces exactly as they appear in the source
+                const destChildIndent = parentIndentLength < childIndent.length
+                    ? childIndent.substring(parentIndentLength)
+                    : '\t'; // Default to tab if child was at same level (shouldn't happen normally)
 
                 // Determine child type and descriptor (from migration marker if present, otherwise preserve original)
                 const childType = childParsed ? childParsed.type : null;
@@ -1888,8 +1903,10 @@ export class BulletJournalMigration {
                         updatedChildLines.push(`${childIndent}- ${childCleanText}`);
                     } else {
                         const childMarker = childParsed.marker;
-                        const childOrigMarker = this.getOriginalMarker(childMarker, childType);
-                        // Replace checkbox content for child: [>mon] → [>] or [<]
+                        // If child has sourceType specified via (...), use that for source marker
+                        const childSourceType = childParsed.sourceType || null;
+                        const childOrigMarker = this.getOriginalMarker(childMarker, childType, childSourceType);
+                        // Replace checkbox content for child: [>mon] → [>] or [<] (or preserved state)
                         const updatedChildLine = child.line.replace(/^(\s*-\s*)\[[^\]]+\]/, `$1[${childOrigMarker}]`);
                         updatedChildLines.push(updatedChildLine);
                     }
@@ -1906,16 +1923,22 @@ export class BulletJournalMigration {
                     }
 
                     // Has checkbox - mark it as migrated with parent's marker type
-                    const parentOrigMarker = this.getOriginalMarker(marker, type);
+                    // If parent has sourceType specified via (...), use that for children too
+                    const parentOrigMarker = this.getOriginalMarker(marker, type, sourceType);
                     if (this.isIncompleteTask(child.line)) {
                         // Mark incomplete task children with parent's marker: [ ] → [>] or [<]
                         updatedChildLines.push(child.line.replace(/^(\s*-\s*)\[\s\]/, `$1[${parentOrigMarker}]`));
-                    } else {
-                        // For non-task children (events, appointments), replace checkbox with parent's marker
+                        childIndicesToUpdate.push(child);
+                    } else if (!this.isCompletedTask(child.line) && !this.isDeletedTask(child.line)) {
+                        // For non-task children (events [o], appointments [a], etc.), replace checkbox with parent's marker
+                        // But NOT completed [x] or cancelled [-] tasks - those stay unchanged
                         const childLineWithMarker = child.line.replace(/^(\s*-\s*)\[[^\]]+\]/, `$1[${parentOrigMarker}]`);
                         updatedChildLines.push(childLineWithMarker);
+                        childIndicesToUpdate.push(child);
+                    } else {
+                        // Completed/cancelled task reached this point - skip it (safety fallback)
+                        console.log(`[BuJo] Skipping completed/cancelled child in fallback: "${this.getTaskText(child.line)}"`);
                     }
-                    childIndicesToUpdate.push(child);
                 }
             }
             
@@ -1932,7 +1955,8 @@ export class BulletJournalMigration {
                 updatedSourceLine = `${indent}- ${text}`;
             } else {
                 // Replace checkbox content: [>mon] → [>] or [<]
-                const origMarker = this.getOriginalMarker(marker, type);
+                // If type is specified (e.g., {/}), preserve that state in source
+                const origMarker = this.getOriginalMarker(marker, type, sourceType);
                 updatedSourceLine = taskLine.replace(/^(\s*-\s*)\[[^\]]+\]/, `$1[${origMarker}]`);
             }
             console.log(`[BuJo] Updated source line: ${updatedSourceLine}`);
@@ -2007,7 +2031,7 @@ export class BulletJournalMigration {
             const parsed = this.parseMigrationMarker(taskLine);
             if (!parsed) return { success: false, error: 'No migration marker found' };
 
-            const { marker, type, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
+            const { marker, type, sourceType, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
 
             // Auto-collect children from source file if none provided
             if (childTasks.length === 0 && !isNewTask) {
@@ -2146,6 +2170,13 @@ export class BulletJournalMigration {
                 const childText = this.getTaskText(child.line);
                 const childCleanText = this.removeMetadata(childText);
 
+                // Calculate relative indent from parent (maintain hierarchy)
+                // Preserve original indentation style (tabs vs spaces)
+                const parentIndentLength = indent.length;
+                const destChildIndent = parentIndentLength < childIndent.length
+                    ? childIndent.substring(parentIndentLength)
+                    : '\t'; // Default to tab if child was at same level
+
                 // Determine child destination marker
                 const childOriginalMarker = this.getBulletMarker(child.line);
                 let childDestMarker;
@@ -2161,7 +2192,7 @@ export class BulletJournalMigration {
                     childDestMarker = '[ ]';
                 }
 
-                const childDestLine = `${childIndent}- ${childDestMarker} ${childCleanText}`;
+                const childDestLine = `${destChildIndent}- ${childDestMarker} ${childCleanText}`;
                 destChildLines.push(childDestLine);
 
                 // Prepare source update for child

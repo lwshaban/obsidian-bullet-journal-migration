@@ -75,6 +75,28 @@ The content in `{...}` becomes the destination checkbox.
 - [>mon{!}] Another custom checkbox type
 - [>w{?}] Question checkbox type
 
+## Source Marker Preservation
+
+Use `(...)` to control what checkbox the source task becomes after migration.
+
+### Preserve In-Progress State
+- [>w(/)] Task stays in-progress in source, becomes incomplete at destination
+- [>fri(/)] Friday task, source shows in-progress
+- [>>(/)] Tomorrow task, preserve in-progress
+
+### Combined Source and Destination Markers
+- [>w(/){=}] Source becomes [/], destination becomes [=]
+- [>fri(/){o}] Source in-progress, destination is event
+- [>m(/){a}] Source in-progress, destination is appointment
+- [>w(=){/}] Source becomes [=], destination becomes [/]
+- [>mon(!){?}] Source becomes [!], destination becomes [?]
+
+### Source Marker with Child Tasks
+- [>w(/)] Parent task in-progress
+	- [ ] Child task (inherits parent's source marker)
+	- [x] Completed child (stays unchanged)
+	- [>fri(/){o}] Child with own markers
+
 ## Special Markers
 
 ### Skip/Mark Without Migrating
@@ -137,6 +159,30 @@ The content in `{...}` becomes the destination checkbox.
 - [>m{.}] Information point for next month
 - [>m3w{=}] Custom task to 3rd week of next month
 
+## Indentation Preservation Tests
+
+### Tab-Indented Children (Should preserve tabs)
+- [>w] Parent with tab-indented children
+	- [ ] First level child (one tab)
+	- [ ] Another first level
+		- [ ] Second level child (two tabs)
+		- [ ] Another second level
+			- [ ] Third level child (three tabs)
+
+### Space-Indented Children (Should preserve spaces)
+- [>fri] Parent with space-indented children
+    - [ ] First level child (4 spaces)
+    - [ ] Another first level
+        - [ ] Second level child (8 spaces)
+
+### Mixed Content with Tabs
+- [>w(/)] In-progress parent with children
+	- [ ] Incomplete child (should migrate)
+	- [x] Completed child (should stay)
+	- [-] Cancelled child (should stay)
+	- [o] Event child (should migrate as event)
+	- Reference note without checkbox (should duplicate)
+
 ## Edge Cases
 
 ### Already Migrated (Should be ignored)
@@ -194,7 +240,9 @@ These are impossible in the new format (marker IS the checkbox):
 ## Expected Behavior
 
 **After migration:**
-- Source tasks show: `- [>] Task` (or `- [<] Task` for scheduled)
+- Source tasks show: `- [>] Task` (default) or `- [<] Task` (for months/future log)
+- With source marker `(/)`: Source shows `- [/] Task` (preserves state)
 - Destination shows: `- [ ] Task` (standard), `- [o] Task` (event), `- [a] Task` (appointment), or custom checkbox types
 - Information points: plain list items without checkboxes
 - Completed/cancelled tasks remain unchanged
+- Child task indentation (tabs/spaces) is preserved exactly as in source

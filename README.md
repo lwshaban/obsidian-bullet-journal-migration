@@ -57,16 +57,38 @@ Add these markers as the checkbox in your task notes:
 |--------|-------------|
 | `[>jan]`, `[>feb]`, `[>mar]`, etc. | Next occurrence of that month |
 
-### Task Type Markers (Destination Checkbox)
+### Task Type Markers (Source & Destination Checkboxes)
 
-Specify what type of checkbox the destination task should have. The content in `{...}` becomes the destination checkbox:
+Control what checkbox type appears in the source note (after migration) and destination note independently:
 
-| Type | Description | Marker Example | Destination |
-|------|-------------|----------------|-------------|
-| `{o}` | Event (one-time occurrence) | `- [>fri{o}] Task` | `- [o] Task` |
-| `{a}` | Appointment (scheduled time) | `- [>mon{a}] Task` | `- [a] Task` |
-| `{.}` | Information point (plain list) | `- [>w{.}] Task` | `- Task` |
-| `{custom}` | Any custom checkbox type | `- [>w{=}] Task` | `- [=] Task` |
+- **`(...)`** - Source checkbox: What the task becomes in the original note after migration
+- **`{...}`** - Destination checkbox: What the task becomes in the target note
+
+| Syntax | Description | Source After | Destination |
+|--------|-------------|--------------|-------------|
+| `[>w]` | Default migration | `[>]` | `[ ]` |
+| `[>w{o}]` | Event at destination | `[>]` | `[o]` |
+| `[>w(/)]` | Preserve in-progress in source | `[/]` | `[ ]` |
+| `[>w(/){o}]` | In-progress source, event destination | `[/]` | `[o]` |
+| `[>w(/){/}]` | Preserve in-progress in both | `[/]` | `[/]` |
+| `[>fri{a}]` | Appointment on Friday | `[>]` | `[a]` |
+| `[>w{.}]` | Information point (plain list) | `- Task` | `- Task` |
+
+#### Examples
+
+**Partially completed task - preserve state:**
+```markdown
+- [>w(/)] Research project
+```
+- Source becomes: `- [/] Research project` (stays in-progress)
+- Destination becomes: `- [ ] Research project`
+
+**Different states for source and destination:**
+```markdown
+- [>fri(/){=}] Design review
+```
+- Source becomes: `- [/] Design review` (marked in-progress)
+- Destination becomes: `- [=] Design review` (custom checkbox)
 
 ### Mark Without Migrating
 

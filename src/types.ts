@@ -2,7 +2,8 @@
 
 export interface MigrationMarker {
 	marker: string;
-	type: TaskType;
+	type: TaskType;           // Destination checkbox via {...} e.g., {=}
+	sourceType?: TaskType;    // Source checkbox via (...) e.g., (/)
 	descriptor?: string | null;
 	originalMarker: string;
 	isInfoPoint?: boolean;
