@@ -37,12 +37,11 @@ function minToTimeStr(startMin: number, endMin: number): string {
 	return `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}-${String(eh).padStart(2,'0')}:${String(em).padStart(2,'0')}`;
 }
 
-/** Generate a short deterministic hash from task text + source file path */
-function taskHash(taskText: string, sourceFile: string): string {
+/** Generate a short deterministic hash from task text (content-based, survives across files) */
+function taskHash(taskText: string): string {
 	let hash = 0;
-	const str = taskText + '::' + sourceFile;
-	for (let i = 0; i < str.length; i++) {
-		const ch = str.charCodeAt(i);
+	for (let i = 0; i < taskText.length; i++) {
+		const ch = taskText.charCodeAt(i);
 		hash = ((hash << 5) - hash) + ch;
 		hash |= 0;
 	}
@@ -492,9 +491,39 @@ export class PlanningWorkspaceView extends ItemView {
 			el.style.opacity = '0.9';
 			document.removeEventListener('mousemove', onMove);
 			document.removeEventListener('mouseup', onUp);
-			const movedDay = block.day !== origDay;
-			this.persistBlock(block, movedDay ? origDay : undefined);
-			if (movedDay) this.renderPool();
+
+			if (block.day !== origDay) {
+				const origDate = this.weekStart.clone().add(origDay, 'days').format('YYYY-MM-DD');
+				const today = moment().format('YYYY-MM-DD');
+
+				if (origDate < today) {
+					// Past day — migrate (remove from old, add to new)
+					this.persistBlock(block, origDay);
+					new Notice(`Migrated "${block.taskText.slice(0,20)}" → ${this.weekStart.clone().add(block.day, 'days').format('ddd')}`);
+				} else {
+					// Future/today — duplicate (keep on both days, create new block on new day)
+					const dup: PlannedBlock = {
+						...block, id: `b${Date.now()}`,
+						day: block.day, startMin: block.startMin, endMin: block.endMin,
+						sourceFile: '',
+					};
+					// Restore original in-memory position
+					const origEnd = block.endMin;
+					block.day = origDay;
+					block.startMin = origStart;
+					block.endMin = origEnd;
+					// Add duplicate to memory and persist
+					const task = this.tasks.find(t => t.task.text === block.taskText);
+					if (task) task.blocks.push(dup);
+					this.persistBlock(dup);
+					new Notice(`Duplicated "${block.taskText.slice(0,20)}" → ${this.weekStart.clone().add(dup.day, 'days').format('ddd')}`);
+				}
+				this.renderPool();
+				this.renderCalendar();
+			} else {
+				// Same day — just update time
+				this.persistBlock(block);
+			}
 		};
 
 		document.addEventListener('mousemove', onMove);
@@ -562,15 +591,15 @@ export class PlanningWorkspaceView extends ItemView {
 	}
 
 	private async persistBlock(block: PlannedBlock, previousDay?: number) {
-		const hash = taskHash(block.taskText, block.sourceFile || '');
+		const hash = taskHash(block.taskText);
 		const dayDate = this.weekStart.clone().add(block.day, 'days').format('YYYY-MM-DD');
 		const filePath = `Journal/001 Daily Notes/${dayDate}.md`;
 
-		// ── Clean up old entry if block was moved to a different day ──
+		// ── Clean up old entry if block was migrated from a past day ──
 		if (previousDay !== undefined && previousDay !== block.day) {
 			const oldDate = this.weekStart.clone().add(previousDay, 'days').format('YYYY-MM-DD');
 			const oldPath = `Journal/001 Daily Notes/${oldDate}.md`;
-			await this.removeBlockFromFile(oldPath, hash);
+			await this.removeBlockFromFile(oldPath, hash, block.startMin, block.endMin);
 		}
 
 		// ── Write to new day ──
@@ -585,46 +614,62 @@ export class PlanningWorkspaceView extends ItemView {
 		const content = await this.app.vault.read(file);
 		const lines = content.split('\n');
 		const timeStr = minToTimeStr(block.startMin, block.endMin);
-		const newLine = `\t- [@] ${timeStr} <!-- bujo:${hash} -->`;
+		const blockLine = `\t- [@] ${timeStr}`;
 
 		const norm = normalizeText(block.taskText);
 		let parentIdx = -1, parentIndent = 0;
 
+		// Find parent by hash or text
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
 			if (!line) continue;
-			const trimmed = line.trim();
-			if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
-			if (/^\s*- \[/.test(line)) {
-				const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
-				const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
-				if (normalizeText(text) === norm && (parentIdx === -1 || indent <= parentIndent)) {
-					parentIdx = i;
-					parentIndent = indent;
-					break;
+			// Match by hash comment
+			if (line.includes(`<!-- bujo:${hash} -->`)) {
+				parentIdx = i;
+				parentIndent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
+				break;
+			}
+		}
+
+		// Fallback: match by text
+		if (parentIdx === -1) {
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
+				if (!line) continue;
+				const trimmed = line.trim();
+				if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
+				if (/^\s*- \[/.test(line)) {
+					const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
+					const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
+					if (normalizeText(text) === norm && (parentIdx === -1 || indent <= parentIndent)) {
+						parentIdx = i;
+						parentIndent = indent;
+						break;
+					}
 				}
 			}
 		}
 
 		if (parentIdx === -1) {
-			lines.push(`- [ ] ${block.taskText}`);
-			lines.push(newLine);
+			// Create parent task with hash ID
+			lines.push(`- [ ] ${block.taskText} <!-- bujo:${hash} -->`);
+			lines.push(blockLine);
 		} else {
-			// Check if a block with this hash already exists — replace it
+			// Ensure parent has hash ID
+			if (!lines[parentIdx]!.includes('<!-- bujo:')) {
+				lines[parentIdx] = lines[parentIdx]!.trimEnd() + ` <!-- bujo:${hash} -->`;
+			}
+
+			// Check if a block with this time already exists — replace it
 			let replaced = false;
 			for (let i = parentIdx + 1; i < lines.length; i++) {
 				const li = lines[i];
 				if (!li || !li.trim()) continue;
 				const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
 				if (indent <= parentIndent) break;
-				if (li.includes(`<!-- bujo:${hash} -->`)) {
-					lines[i] = newLine;
-					replaced = true;
-					break;
-				}
-				// Also match by text fragment for backward compatibility
-				if (li.includes('[@]') && !li.includes('<!--') && normalizeText(li).includes(norm.slice(0, 15))) {
-					lines[i] = newLine;
+				// Match by same time range
+				if (li.includes('[@]') && li.includes(timeStr)) {
+					lines[i] = blockLine;
 					replaced = true;
 					break;
 				}
@@ -638,7 +683,7 @@ export class PlanningWorkspaceView extends ItemView {
 					if (indent <= parentIndent) { insert = i; break; }
 					insert = i + 1;
 				}
-				lines.splice(insert, 0, newLine);
+				lines.splice(insert, 0, blockLine);
 			}
 		}
 
@@ -646,17 +691,34 @@ export class PlanningWorkspaceView extends ItemView {
 		block.sourceFile = filePath;
 	}
 
-	/** Remove an [@] block by hash from a file */
-	private async removeBlockFromFile(filePath: string, hash: string) {
+	/** Remove a specific [@] block from a file by finding the parent task hash and matching the time range */
+	private async removeBlockFromFile(filePath: string, hash: string, startMin: number, endMin: number) {
 		const file = this.app.vault.getAbstractFileByPath(filePath);
 		if (!(file instanceof TFile)) return;
 
 		const content = await this.app.vault.read(file);
 		const lines = content.split('\n');
-		const tag = `<!-- bujo:${hash} -->`;
+		const timeStr = minToTimeStr(startMin, endMin);
 
+		// Find parent by hash
+		let parentIdx = -1, parentIndent = 0;
 		for (let i = 0; i < lines.length; i++) {
-			if (lines[i]?.includes(tag)) {
+			if (lines[i]?.includes(`<!-- bujo:${hash} -->`)) {
+				parentIdx = i;
+				parentIndent = (lines[i]?.match(/^(\s*)/)?.[1]?.length) || 0;
+				break;
+			}
+		}
+
+		if (parentIdx === -1) return;
+
+		// Remove matching [@] child by time range
+		for (let i = parentIdx + 1; i < lines.length; i++) {
+			const li = lines[i];
+			if (!li || !li.trim()) continue;
+			const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
+			if (indent <= parentIndent) break;
+			if (li.includes('[@]') && li.includes(timeStr)) {
 				lines.splice(i, 1);
 				await this.app.vault.modify(file, lines.join('\n'));
 				return;
@@ -666,7 +728,7 @@ export class PlanningWorkspaceView extends ItemView {
 
 	/** Delete a block from the calendar and its markdown */
 	private deleteBlock(block: PlannedBlock) {
-		const hash = taskHash(block.taskText, block.sourceFile);
+		const hash = taskHash(block.taskText);
 
 		// Remove from in-memory state
 		const task = this.tasks.find(t => t.task.text === block.taskText);
@@ -676,7 +738,7 @@ export class PlanningWorkspaceView extends ItemView {
 		}
 
 		// Remove from markdown
-		this.removeBlockFromFile(block.sourceFile, hash);
+		this.removeBlockFromFile(block.sourceFile, hash, block.startMin, block.endMin);
 
 		// Re-render
 		this.renderPool();
