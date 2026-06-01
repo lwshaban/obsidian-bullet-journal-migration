@@ -15,6 +15,7 @@ import {
 	parseTimeRange,
 } from './timeTracking';
 import { WeeklyPlannerModal } from './planner';
+import { MigrationPickerModal } from './migration-ui';
 
 export default class BujoMigrationPlugin extends Plugin {
 	settings: BujoPluginSettings;
@@ -68,6 +69,12 @@ export default class BujoMigrationPlugin extends Plugin {
 			id: 'bujo-plan-week',
 			name: 'Plan week (calendar)',
 			callback: () => new WeeklyPlannerModal(this.app).open(),
+		});
+
+		this.addCommand({
+			id: 'bujo-migrate-task-ui',
+			name: 'Migrate task (visual picker)',
+			editorCallback: (editor) => new MigrationPickerModal(this.app, editor).open(),
 		});
 
 		this.addCommand({
