@@ -37,6 +37,18 @@ function minToTimeStr(startMin: number, endMin: number): string {
 	return `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}-${String(eh).padStart(2,'0')}:${String(em).padStart(2,'0')}`;
 }
 
+/** Generate a short deterministic hash from task text + source file path */
+function taskHash(taskText: string, sourceFile: string): string {
+	let hash = 0;
+	const str = taskText + '::' + sourceFile;
+	for (let i = 0; i < str.length; i++) {
+		const ch = str.charCodeAt(i);
+		hash = ((hash << 5) - hash) + ch;
+		hash |= 0;
+	}
+	return Math.abs(hash).toString(36).slice(0, 6);
+}
+
 function parseTimeToMin(range: string): { startMin: number; endMin: number; minutes: number } | null {
 	const parsed = parseTimeRange(range);
 	if (!parsed) return null;
@@ -255,21 +267,46 @@ export class PlanningWorkspaceView extends ItemView {
 	}
 
 	private async toggleTaskDone(task: TaskState) {
-		const file = this.app.vault.getAbstractFileByPath(task.task.file);
-		if (!(file instanceof TFile)) return;
-
-		const content = await this.app.vault.read(file);
-		const lines = content.split('\n');
-		const norm = normalizeText(task.task.text);
-
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!line || !isIncompleteTask(line)) continue;
-			if (normalizeText(getTaskText(line)) === norm) {
-				lines[i] = line.replace(/^(\s*-\s*)\[\s\]/, '$1[-]');
-				await this.app.vault.modify(file, lines.join('\n'));
+		try {
+			const file = this.app.vault.getAbstractFileByPath(task.task.file);
+			if (!(file instanceof TFile)) {
+				new Notice(`Could not find file: ${task.task.file}`);
 				return;
 			}
+
+			const content = await this.app.vault.read(file);
+			const lines = content.split('\n');
+			const norm = normalizeText(task.task.text);
+			let found = false;
+
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
+				if (!line) continue;
+				// Match any incomplete task line
+				if (!isIncompleteTask(line) && !isCompletedTask(line)) continue;
+				const lineText = getTaskText(line);
+				if (normalizeText(lineText) === norm) {
+					// Toggle: if currently [-], make [ ]; if [ ] or [x], make [-]
+					const isAlreadyCancelled = /^\s*-\s*\[-\]/.test(line);
+					if (isAlreadyCancelled) {
+						lines[i] = line.replace(/^(\s*-\s*)\[-\]/, '$1[ ]');
+					} else {
+						lines[i] = line.replace(/^(\s*-\s*)\[[^\]]+\]/, '$1[-]');
+					}
+					found = true;
+					break;
+				}
+			}
+
+			if (found) {
+				await this.app.vault.modify(file, lines.join('\n'));
+				new Notice(task.done ? 'Task cancelled' : 'Task restored');
+			} else {
+				console.warn(`[BuJo] toggleTaskDone: task not found in file: "${task.task.text}" in ${task.task.file}`);
+			}
+		} catch (err) {
+			console.error('[BuJo] toggleTaskDone error:', err);
+			new Notice('Failed to update task');
 		}
 	}
 
@@ -379,10 +416,43 @@ export class PlanningWorkspaceView extends ItemView {
 			box-sizing:border-box; line-height:1.3;
 			transition: box-shadow 0.1s;
 		`;
-		el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0,30)}</div><div style="opacity:0.8;">${minToTimeStr(block.startMin, block.endMin)}</div>`;
+		el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0,30)}</div><div style="opacity:0.8;">${minToTimeStr(block.startMin, block.endMin)}</div><div class="bujo-block-actions" style="position:absolute;top:1px;right:3px;display:none;gap:2px;"><span class="bujo-block-dup" title="Alt+click to duplicate" style="cursor:pointer;font-size:10px;opacity:0.6;">⧉</span><span class="bujo-block-del" title="Delete" style="cursor:pointer;font-size:11px;opacity:0.7;">✕</span></div>`;
+
+		// Show actions on hover
+		el.onmouseenter = () => {
+			const actions = el.querySelector('.bujo-block-actions') as HTMLElement;
+			if (actions) actions.style.display = 'flex';
+		};
+		el.onmouseleave = () => {
+			const actions = el.querySelector('.bujo-block-actions') as HTMLElement;
+			if (actions) actions.style.display = 'none';
+		};
+
+		// Delete button
+		el.querySelector('.bujo-block-del')?.addEventListener('click', (e) => {
+			e.stopPropagation();
+			e.preventDefault();
+			this.deleteBlock(block);
+		});
+
+		// Duplicate button
+		el.querySelector('.bujo-block-dup')?.addEventListener('click', (e) => {
+			e.stopPropagation();
+			e.preventDefault();
+			this.duplicateBlock(block);
+		});
+
+		// Alt+click to duplicate
+		el.addEventListener('click', (e) => {
+			if (e.altKey) {
+				e.stopPropagation();
+				e.preventDefault();
+				this.duplicateBlock(block);
+			}
+		});
 
 		// ── Drag entire block to move ──
-		let dragging = false, dragStartX = 0, dragStartY = 0, origDay = 0, origStart = 0;
+		let dragging = false, dragStartX = 0, dragStartY = 0, origDay = block.day, origStart = block.startMin;
 
 		el.onmousedown = (e) => {
 			if ((e.target as HTMLElement).classList.contains('bujo-resize')) return;
@@ -422,8 +492,9 @@ export class PlanningWorkspaceView extends ItemView {
 			el.style.opacity = '0.9';
 			document.removeEventListener('mousemove', onMove);
 			document.removeEventListener('mouseup', onUp);
-			if (block.day !== origDay) block.sourceFile = ''; // will be re-assigned on persist
-			this.persistBlock(block);
+			const movedDay = block.day !== origDay;
+			this.persistBlock(block, movedDay ? origDay : undefined);
+			if (movedDay) this.renderPool();
 		};
 
 		document.addEventListener('mousemove', onMove);
@@ -490,10 +561,19 @@ export class PlanningWorkspaceView extends ItemView {
 		this.renderCalendar();
 	}
 
-	private async persistBlock(block: PlannedBlock) {
+	private async persistBlock(block: PlannedBlock, previousDay?: number) {
+		const hash = taskHash(block.taskText, block.sourceFile || '');
 		const dayDate = this.weekStart.clone().add(block.day, 'days').format('YYYY-MM-DD');
 		const filePath = `Journal/001 Daily Notes/${dayDate}.md`;
 
+		// ── Clean up old entry if block was moved to a different day ──
+		if (previousDay !== undefined && previousDay !== block.day) {
+			const oldDate = this.weekStart.clone().add(previousDay, 'days').format('YYYY-MM-DD');
+			const oldPath = `Journal/001 Daily Notes/${oldDate}.md`;
+			await this.removeBlockFromFile(oldPath, hash);
+		}
+
+		// ── Write to new day ──
 		let file = this.app.vault.getAbstractFileByPath(filePath);
 		if (!(file instanceof TFile)) {
 			const f = this.app.vault.getAbstractFileByPath('Journal/001 Daily Notes');
@@ -505,7 +585,7 @@ export class PlanningWorkspaceView extends ItemView {
 		const content = await this.app.vault.read(file);
 		const lines = content.split('\n');
 		const timeStr = minToTimeStr(block.startMin, block.endMin);
-		const newLine = `\t- [@] ${timeStr}`;
+		const newLine = `\t- [@] ${timeStr} <!-- bujo:${hash} -->`;
 
 		const norm = normalizeText(block.taskText);
 		let parentIdx = -1, parentIndent = 0;
@@ -530,15 +610,20 @@ export class PlanningWorkspaceView extends ItemView {
 			lines.push(`- [ ] ${block.taskText}`);
 			lines.push(newLine);
 		} else {
-			// Replace existing [@] for this block or insert
+			// Check if a block with this hash already exists — replace it
 			let replaced = false;
 			for (let i = parentIdx + 1; i < lines.length; i++) {
 				const li = lines[i];
 				if (!li || !li.trim()) continue;
 				const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
 				if (indent <= parentIndent) break;
-				// Match by task text substring
-				if (li.includes('[@]') && normalizeText(li).includes(norm.slice(0, 15))) {
+				if (li.includes(`<!-- bujo:${hash} -->`)) {
+					lines[i] = newLine;
+					replaced = true;
+					break;
+				}
+				// Also match by text fragment for backward compatibility
+				if (li.includes('[@]') && !li.includes('<!--') && normalizeText(li).includes(norm.slice(0, 15))) {
 					lines[i] = newLine;
 					replaced = true;
 					break;
@@ -559,5 +644,65 @@ export class PlanningWorkspaceView extends ItemView {
 
 		await this.app.vault.modify(file, lines.join('\n'));
 		block.sourceFile = filePath;
+	}
+
+	/** Remove an [@] block by hash from a file */
+	private async removeBlockFromFile(filePath: string, hash: string) {
+		const file = this.app.vault.getAbstractFileByPath(filePath);
+		if (!(file instanceof TFile)) return;
+
+		const content = await this.app.vault.read(file);
+		const lines = content.split('\n');
+		const tag = `<!-- bujo:${hash} -->`;
+
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i]?.includes(tag)) {
+				lines.splice(i, 1);
+				await this.app.vault.modify(file, lines.join('\n'));
+				return;
+			}
+		}
+	}
+
+	/** Delete a block from the calendar and its markdown */
+	private deleteBlock(block: PlannedBlock) {
+		const hash = taskHash(block.taskText, block.sourceFile);
+
+		// Remove from in-memory state
+		const task = this.tasks.find(t => t.task.text === block.taskText);
+		if (task) {
+			const idx = task.blocks.indexOf(block);
+			if (idx !== -1) task.blocks.splice(idx, 1);
+		}
+
+		// Remove from markdown
+		this.removeBlockFromFile(block.sourceFile, hash);
+
+		// Re-render
+		this.renderPool();
+		this.renderCalendar();
+	}
+
+	/** Duplicate a block (same task, new time slot) */
+	private duplicateBlock(block: PlannedBlock) {
+		const dup: PlannedBlock = {
+			...block,
+			id: `b${Date.now()}`,
+			taskText: block.taskText,
+			day: block.day,
+			startMin: block.startMin + 60, // offset by 1 hour
+			endMin: block.endMin + 60,
+			durationMin: block.durationMin,
+			sourceFile: block.sourceFile,
+			color: block.color,
+		};
+
+		const task = this.tasks.find(t => t.task.text === block.taskText);
+		if (task) {
+			task.blocks.push(dup);
+		}
+
+		this.persistBlock(dup);
+		this.renderCalendar();
 	}
 }

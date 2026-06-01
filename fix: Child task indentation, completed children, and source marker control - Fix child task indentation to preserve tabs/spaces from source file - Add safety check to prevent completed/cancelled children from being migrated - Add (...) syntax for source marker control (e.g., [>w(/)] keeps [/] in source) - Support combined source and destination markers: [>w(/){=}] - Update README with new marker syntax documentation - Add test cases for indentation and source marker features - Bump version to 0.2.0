@@ -1,0 +1,8 @@
+fix: Child task indentation, completed children, and source marker control
+- Fix child task indentation to preserve tabs/spaces from source file
+- Add safety check to prevent completed/cancelled children from being migrated
+- Add (...) syntax for source marker control (e.g., [>w(/)] keeps [/] in source)
+- Support combined source and destination markers: [>w(/){=}]
+- Update README with new marker syntax documentation
+- Add test cases for indentation and source marker features
+- Bump version to 0.2.0
