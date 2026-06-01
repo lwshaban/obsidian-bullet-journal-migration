@@ -3,9 +3,23 @@
 
 import { App, Notice, TFile, TFolder, moment, Editor } from 'obsidian';
 import { MigrationMarker, MigrationResult, TaskType, PeriodType, ChildTask, DestinationDate } from './types';
-// @ts-nocheck
-// CustomJS Script: Bullet Journal Migration System
-// Provides weekly and monthly review generation and processing
+import {
+	normalizeText,
+	isIncompleteTask,
+	isCompletedTask,
+	isDeletedTask,
+	isScheduledTask,
+	isBulletItem,
+	getTaskText,
+	getBulletMarker,
+	getIndentLevel,
+	removeMetadata,
+	collectChildTasks,
+	fuzzyFindLine,
+	headingToSourcePath,
+	resolveDestinationMarker,
+	tryParseHeadingPath,
+} from './utils';
 
 export class BulletJournalMigration {
 	app: App;
@@ -463,113 +477,26 @@ export class BulletJournalMigration {
     }
 
     /**
-     * Remove metadata from task line
-     */
-    removeMetadata(line: string): string {
-        return line.replace(/\s*\(from:\s*[^)]+\)/, '');
-    }
-
-    /**
      * Check if line has migration marker
      */
     hasMigrationMarker(line: string): boolean {
         return this.parseMigrationMarker(line) !== null;
     }
 
-    /**
-     * Check if line is incomplete task
-     */
-    isIncompleteTask(line: string): boolean {
-        return /^-\s*\[\s\]/.test(line.trim());
-    }
+    // ── These are thin wrappers around utils functions for internal use ──────
+    // (Methods below like migrateTask still reference `this.isBulletItem()` etc.
+    //  so we keep the method interface but delegate to utils.)
 
-    /**
-     * Check if line is completed task
-     */
-    isCompletedTask(line: string): boolean {
-        return /^-\s*\[x\]/i.test(line.trim());
-    }
-
-    /**
-     * Check if line is deleted/cancelled task
-     */
-    isDeletedTask(line: string): boolean {
-        return /^-\s*\[-\]/.test(line.trim());
-    }
-
-    /**
-     * Check if line is scheduled task ([s])
-     */
-    isScheduledTask(line: string): boolean {
-        return /^-\s*\[s\]/.test(line.trim());
-    }
-
-    /**
-     * Check if line is a bullet item (task, event, information, etc.)
-     */
-    isBulletItem(line: string): boolean {
-        // Matches any bullet item: - [ ], - [x], - [o], - [a], - [-], - [s], - [>marker], etc.
-        // Also matches plain list items: - Information text (no brackets)
-        const trimmed = line.trim();
-        return /^\s*-\s*(\[[^\]]+\]|.+)/.test(trimmed) || /^\s*-\s+/.test(trimmed);
-    }
-
-    /**
-     * Get task text without checkbox (handles indented/nested tasks and plain list items)
-     */
-    getTaskText(line: string): string {
-        // Match task with optional leading whitespace (for nested tasks)
-        const taskMatch = line.match(/^\s*-\s*\[[^\]]+\]\s*(.+)$/);
-        if (taskMatch && taskMatch[1]) return taskMatch[1].trim();
-
-        // Match plain list item (information point): - Information text
-        const plainMatch = line.match(/^\s*-\s+(.+)$/);
-        if (plainMatch && plainMatch[1]) return plainMatch[1].trim();
-
-        return '';
-    }
-
-    /**
-     * Get bullet marker from line (e.g., ' ', 'x', 'o', 'a', '-', 's', '>w', etc.)
-     */
-    getBulletMarker(line: string): string | null {
-        const match = line.match(/^\s*-\s*\[([^\]]+)\]/);
-        return (match && match[1]) ? match[1].trim() : null;
-    }
-
-    /**
-     * Get indentation level of a line (number of spaces or tabs)
-     */
-    getIndentLevel(line: string): number {
-        const match = line.match(/^(\s*)/);
-        return (match && match[1]) ? match[1].length : 0;
-    }
-
-    /**
-     * Collect child tasks (nested tasks with more indentation) following a parent task
-     */
-    collectChildTasks(lines: string[], parentIndex: number, parentIndent: number): Array<{ line: string; index: number; indent: number }> {
-        const children: Array<{ line: string; index: number; indent: number }> = [];
-        for (let i = parentIndex + 1; i < lines.length; i++) {
-            const line = lines[i];
-            if (!line) continue;
-            const lineIndent = this.getIndentLevel(line);
-            
-            // If line has same or less indentation, we've reached the end of children
-            if (lineIndent <= parentIndent) {
-                break;
-            }
-            
-            // If line is empty or not a bullet item, skip it
-            if (!line.trim() || !this.isBulletItem(line)) {
-                continue;
-            }
-            
-            // This is a child task
-            children.push({ line, index: i, indent: lineIndent });
-        }
-        return children;
-    }
+    isIncompleteTask = isIncompleteTask;
+    isCompletedTask = isCompletedTask;
+    isDeletedTask = isDeletedTask;
+    isScheduledTask = isScheduledTask;
+    isBulletItem = isBulletItem;
+    getTaskText = getTaskText;
+    getBulletMarker = getBulletMarker;
+    getIndentLevel = getIndentLevel;
+    removeMetadata = removeMetadata;
+    collectChildTasks = collectChildTasks;
 
     /**
      * Detect period type from file path
@@ -833,14 +760,7 @@ export class BulletJournalMigration {
             const oldTaskTextClean = this.removeMetadata(oldTaskText).trim();  // Remove (from: ...) metadata and trim
             console.log(`[BuJo] Looking for task with text: "${oldTaskTextClean}" in ${filePath}`);
             
-            // Normalize text for better matching (remove extra spaces, normalize wiki links)
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')  // Normalize whitespace
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')  // Remove wiki link brackets
-                    .trim();
-            };
-            const normalizedOldText = normalizeText(oldTaskTextClean);
+            const normalizedOldText = this.normalizeText(oldTaskTextClean);
             
             const updatedLinesLenient = lines.map(line => {
                 // Match any task (incomplete, completed, deleted, or with migration markers)
@@ -849,7 +769,7 @@ export class BulletJournalMigration {
                 if (!found && isTask) {
                     const lineTaskText = this.getTaskText(line);
                     const lineTaskTextClean = this.removeMetadata(lineTaskText).trim();
-                    const normalizedLineText = normalizeText(lineTaskTextClean);
+                    const normalizedLineText = this.normalizeText(lineTaskTextClean);
                     
                     // Compare task text (normalized, case-insensitive)
                     if (normalizedLineText === normalizedOldText) {
@@ -879,7 +799,7 @@ export class BulletJournalMigration {
                     if (/^\s*-\s*\[[^\]]+\]/.test(line)) {
                         const lineTaskText = this.getTaskText(line);
                         const lineTaskTextClean = this.removeMetadata(lineTaskText).trim();
-                        const normalizedLineText = normalizeText(lineTaskTextClean);
+                        const normalizedLineText = this.normalizeText(lineTaskTextClean);
                         const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
                         
                         // Count matching words
@@ -926,7 +846,7 @@ export class BulletJournalMigration {
                 const alreadyInState = lines.some(line => {
                     if (!/^\s*-\s*\[/.test(line)) return false;
                     const lineText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(this.removeMetadata(lineText));
+                    const normalizedLineText = this.normalizeText(this.removeMetadata(lineText));
                     return normalizedLineText === normalizedOldText && line.includes(`[${marker}]`);
                 });
                 
@@ -966,19 +886,12 @@ export class BulletJournalMigration {
             const taskTextClean = taskText.trim();
             console.log(`[BuJo] Looking for task to complete: "${taskTextClean}" in ${sourceFilePath}`);
 
-            // Normalize text for better matching
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
             const updatedLines = lines.map(line => {
                 if (!found && this.isIncompleteTask(line)) {
                     const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(lineTaskText);
+                    const normalizedLineText = this.normalizeText(lineTaskText);
                     
                     // Compare task text (normalized, case-insensitive)
                     if (normalizedLineText === normalizedTaskText) {
@@ -993,27 +906,10 @@ export class BulletJournalMigration {
 
             // Try fuzzy matching if exact match not found
             if (!found) {
-                const taskWords = normalizedTaskText.split(/\s+/).filter((w: string) => w.length > 2);
-                let bestMatch: string | null = null;
-                let bestScore = 0;
-                
-                lines.forEach(line => {
-                    if (this.isIncompleteTask(line)) {
-                        const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = normalizeText(lineTaskText);
-                        const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-                        
-                        const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
-                        const score = matchingWords / Math.max(taskWords.length, lineWords.length);
-                        
-                        if (score > bestScore && score > 0.7) {
-                            bestScore = score;
-                            bestMatch = line;
-                        }
-                    }
-                });
-                
-                if (bestMatch) {
+                const fuzzyResult = fuzzyFindLine(lines, normalizedTaskText, (l) => this.isIncompleteTask(l));
+                if (fuzzyResult) {
+                    const bestMatch = fuzzyResult.line;
+                    const bestScore = fuzzyResult.score;
                     console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to complete: "${this.getTaskText(bestMatch)}"`);
                     const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[\s\]/, '$1[x]') : l);
                     await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
@@ -1054,19 +950,12 @@ export class BulletJournalMigration {
             const taskTextClean = taskText.trim();
             console.log(`[BuJo] Looking for task to cancel: "${taskTextClean}" in ${sourceFilePath}`);
 
-            // Normalize text for better matching
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
             const updatedLines = lines.map(line => {
                 if (!found && this.isIncompleteTask(line)) {
                     const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(lineTaskText);
+                    const normalizedLineText = this.normalizeText(lineTaskText);
                     
                     // Compare task text (normalized, case-insensitive)
                     if (normalizedLineText === normalizedTaskText) {
@@ -1081,27 +970,10 @@ export class BulletJournalMigration {
 
             // Try fuzzy matching if exact match not found
             if (!found) {
-                const taskWords = normalizedTaskText.split(/\s+/).filter((w: string) => w.length > 2);
-                let bestMatch: string | null = null;
-                let bestScore = 0;
-                
-                lines.forEach(line => {
-                    if (this.isIncompleteTask(line)) {
-                        const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = normalizeText(lineTaskText);
-                        const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-                        
-                        const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
-                        const score = matchingWords / Math.max(taskWords.length, lineWords.length);
-                        
-                        if (score > bestScore && score > 0.7) {
-                            bestScore = score;
-                            bestMatch = line;
-                        }
-                    }
-                });
-                
-                if (bestMatch) {
+                const fuzzyResult = fuzzyFindLine(lines, normalizedTaskText, (l) => this.isIncompleteTask(l));
+                if (fuzzyResult) {
+                    const bestMatch = fuzzyResult.line;
+                    const bestScore = fuzzyResult.score;
                     console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to cancel: "${this.getTaskText(bestMatch)}"`);
                     const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[\s\]/, '$1[-]') : l);
                     await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
@@ -1143,14 +1015,7 @@ export class BulletJournalMigration {
             const taskTextClean = taskText.trim();
             console.log(`[BuJo] Looking for task to remove: "${taskTextClean}" in ${sourceFilePath}`);
 
-            // Normalize text for better matching
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
             // Find the parent task
             for (let i = 0; i < lines.length; i++) {
@@ -1159,7 +1024,7 @@ export class BulletJournalMigration {
                 const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
                 if (isTask) {
                     const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(lineTaskText);
+                    const normalizedLineText = this.normalizeText(lineTaskText);
                     
                     if (normalizedLineText === normalizedTaskText) {
                         console.log(`[BuJo] Found matching task to remove: "${lineTaskText}"`);
@@ -1229,14 +1094,7 @@ export class BulletJournalMigration {
             const taskTextClean = taskText.trim();
             console.log(`[BuJo] Looking for task to mark as scheduled: "${taskTextClean}" in ${sourceFilePath}`);
 
-            // Normalize text for better matching
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
             const updatedLines = lines.map(line => {
                 // Match any task (incomplete, completed, deleted, or with migration markers)
@@ -1248,7 +1106,7 @@ export class BulletJournalMigration {
                     }
                     
                     const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(lineTaskText);
+                    const normalizedLineText = this.normalizeText(lineTaskText);
                     
                     // Compare task text (normalized, case-insensitive)
                     if (normalizedLineText === normalizedTaskText) {
@@ -1277,7 +1135,7 @@ export class BulletJournalMigration {
                         }
                         
                         const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = normalizeText(lineTaskText);
+                        const normalizedLineText = this.normalizeText(lineTaskText);
                         const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
                         
                         const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
@@ -1331,21 +1189,14 @@ export class BulletJournalMigration {
             const taskTextClean = taskText.trim();
             console.log(`[BuJo] Looking for task to mark as migrated: "${taskTextClean}" in ${sourceFilePath}`);
 
-            // Normalize text for better matching
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
             const updatedLines = lines.map(line => {
                 // Match any task (incomplete, completed, deleted, or with migration markers)
                 const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
                 if (!found && isTask) {
                     const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = normalizeText(lineTaskText);
+                    const normalizedLineText = this.normalizeText(lineTaskText);
                     
                     // Compare task text (normalized, case-insensitive)
                     if (normalizedLineText === normalizedTaskText) {
@@ -1369,7 +1220,7 @@ export class BulletJournalMigration {
                     const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
                     if (isTask) {
                         const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = normalizeText(lineTaskText);
+                        const normalizedLineText = this.normalizeText(lineTaskText);
                         const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
                         
                         const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
@@ -1499,13 +1350,7 @@ export class BulletJournalMigration {
             // Find the parent task in the source file
             let parentIndex = -1;
             let parentIndent = 0;
-            const normalizeText = (text: string): string => {
-                return text.toLowerCase()
-                    .replace(/\s+/g, ' ')
-                    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                    .trim();
-            };
-            const normalizedParentText = normalizeText(parentTaskText);
+            const normalizedParentText = this.normalizeText(parentTaskText);
             
             // First, try exact match
             for (let i = 0; i < lines.length; i++) {
@@ -1513,7 +1358,7 @@ export class BulletJournalMigration {
                 if (!line) continue;
                 if (this.isBulletItem(line)) {
                     const lineText = this.getTaskText(line);
-                    const normalizedLineText = normalizeText(lineText);
+                    const normalizedLineText = this.normalizeText(lineText);
                     
                     // Exact match
                     if (normalizedLineText === normalizedParentText) {
@@ -1532,7 +1377,7 @@ export class BulletJournalMigration {
                     if (!line) continue;
                     if (this.isBulletItem(line)) {
                         const lineText = this.getTaskText(line);
-                        const normalizedLineText = normalizeText(lineText);
+                        const normalizedLineText = this.normalizeText(lineText);
                         
                         // Check if one contains the other (for cases where metadata differs)
                         if (normalizedLineText.includes(normalizedParentText) ||
@@ -1572,15 +1417,7 @@ export class BulletJournalMigration {
         }
     }
 
-    /**
-     * Normalize text for comparison (remove metadata, normalize whitespace)
-     */
-    normalizeText(text: string): string {
-        return text.toLowerCase()
-            .replace(/\s+/g, ' ')
-            .replace(/\[\[([^\]]+)\]\]/g, '$1')
-            .trim();
-    }
+    normalizeText = normalizeText;
 
     /**
      * Migrate a single task (and optionally its children)
@@ -1684,20 +1521,13 @@ export class BulletJournalMigration {
                 const taskTextClean = taskText.trim();
                 console.log(`[BuJo] Looking for task to mark as ${marker}: "${taskTextClean}" in ${sourceFilePath}`);
 
-                // Normalize text for better matching
-                const normalizeText = (text: string): string => {
-                    return text.toLowerCase()
-                        .replace(/\s+/g, ' ')
-                        .replace(/\[\[([^\]]+)\]\]/g, '$1')
-                        .trim();
-                };
-                const normalizedTaskText = normalizeText(taskTextClean);
+const normalizedTaskText = this.normalizeText(taskTextClean);
 
                 // Find parent task and track its position and indentation
                 const updatedLines = lines.map((line, index) => {
                     if (!foundParent && this.isIncompleteTask(line)) {
                         const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = normalizeText(lineTaskText);
+                        const normalizedLineText = this.normalizeText(lineTaskText);
 
                         // Compare task text (normalized, case-insensitive)
                         if (normalizedLineText === normalizedTaskText) {
@@ -1722,7 +1552,7 @@ export class BulletJournalMigration {
                     lines.forEach((line, index) => {
                         if (this.isIncompleteTask(line)) {
                             const lineTaskText = this.getTaskText(line).trim();
-                            const normalizedLineText = normalizeText(lineTaskText);
+                            const normalizedLineText = this.normalizeText(lineTaskText);
                             const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
 
                             const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
@@ -2567,69 +2397,11 @@ export class BulletJournalMigration {
                 if (!line) continue;
                 const trimmedLine = line.trim();
                 
-                // Check if this is a source path heading (## or ###)
-                if (trimmedLine.startsWith('### ')) {
-                    let potentialPath = trimmedLine.substring(4).trim();
-                    // Strip wikilink brackets if present
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    // Check if it's a date format and reconstruct full path
-                    // Daily: 2026-01-07 → Journal/001 Daily Notes/2026-01-07.md
-                    // Weekly: 2026-W02 → Journal/002 Weekly Notes/2026-W02.md
-                    // Monthly: 2026-02 → Journal/003 Monthly Notes/2026-02.md
-                    // Yearly: 2026 → Journal/004 Yearly Notes/2026.md
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        // Daily note format
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ### heading (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        // Weekly note format
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ### heading (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        // Monthly note format
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ### heading (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        // Yearly note format
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ### heading (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        // Full path provided
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path from ### heading (full path): ${currentSourcePath}`);
-                    }
-                    continue;
-                }
-
-                // Check for ## heading as source path (for weekly reviews)
-                if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
-                    let potentialPath = trimmedLine.substring(3).trim();
-                    // Strip wikilink brackets if present
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    // Check if it's a date format and reconstruct full path
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        // Daily note format
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ## heading (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        // Weekly note format
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ## heading (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        // Monthly note format
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ## heading (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        // Yearly note format
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path from ## heading (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        // Full path provided
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path from ## heading (full path): ${currentSourcePath}`);
-                    }
+                // Parse headings for source path (## or ###)
+                const headingPath = tryParseHeadingPath(trimmedLine);
+                if (headingPath) {
+                    currentSourcePath = headingPath;
+                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
                     continue;
                 }
                 
@@ -2942,31 +2714,13 @@ export class BulletJournalMigration {
                 if (!line) continue;
                 const trimmedLine = line.trim();
 
-                // Check if this is a source path heading (### for individual files)
-                if (trimmedLine.startsWith('### ')) {
-                    let potentialPath = trimmedLine.substring(4).trim();
-                    // Remove wiki link brackets if present: [[2026-01-07]] → 2026-01-07
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    // Convert date patterns to full paths
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path (full): ${currentSourcePath}`);
-                    }
+                const headingPath = tryParseHeadingPath(trimmedLine);
+                if (headingPath) {
+                    currentSourcePath = headingPath;
+                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
                     continue;
                 }
+
 
                 // Check for ## heading (section headers) - skip these
                 if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
@@ -3402,36 +3156,13 @@ export class BulletJournalMigration {
                 if (!line) continue;
                 const trimmedLine = line.trim();
 
-                // Check if this is a source path heading (### for individual files)
-                if (trimmedLine.startsWith('### ')) {
-                    let potentialPath = trimmedLine.substring(4).trim();
-                    // Remove wiki link brackets if present: [[2026-01-07]] → 2026-01-07
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    // Convert date patterns to full paths
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        // Daily note: 2026-01-07 → Journal/001 Daily Notes/2026-01-07.md
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        // Weekly note: 2026-W05 → Journal/002 Weekly Notes/2026-W05.md
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        // Monthly note: 2026-01 → Journal/003 Monthly Notes/2026-01.md
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        // Yearly note: 2026 → Journal/004 Yearly Notes/2026.md
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        // Full path already provided
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path (full): ${currentSourcePath}`);
-                    }
+                const headingPath = tryParseHeadingPath(trimmedLine);
+                if (headingPath) {
+                    currentSourcePath = headingPath;
+                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
                     continue;
                 }
+
 
                 // Check for ## heading (section headers like "Daily Notes", "Weekly Notes")
                 if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
@@ -3600,51 +3331,11 @@ export class BulletJournalMigration {
                 }
                 const trimmedLine = line.trim();
 
-                // Track source path from headings
-                if (trimmedLine.startsWith('### ')) {
-                    let potentialPath = trimmedLine.substring(4).trim();
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path (full): ${currentSourcePath}`);
-                    }
-                    linesToKeep.push(line); // Keep headings
-                    continue;
-                }
-
-                if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
-                    let potentialPath = trimmedLine.substring(3).trim();
-                    potentialPath = potentialPath.replace(/^\[\[(.+)\]\]$/, '$1');
-
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/001 Daily Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (daily): ${currentSourcePath}`);
-                    } else if (/^\d{4}-W\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/002 Weekly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (weekly): ${currentSourcePath}`);
-                    } else if (/^\d{4}-\d{2}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/003 Monthly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (monthly): ${currentSourcePath}`);
-                    } else if (/^\d{4}$/.test(potentialPath)) {
-                        currentSourcePath = `Journal/004 Yearly Notes/${potentialPath}.md`;
-                        console.log(`[BuJo] Set source path (yearly): ${currentSourcePath}`);
-                    } else if (potentialPath.includes('/') && potentialPath.endsWith('.md')) {
-                        currentSourcePath = potentialPath;
-                        console.log(`[BuJo] Set source path (full): ${currentSourcePath}`);
-                    }
+                // Parse headings for source path (## or ###)
+                const headingPath = tryParseHeadingPath(trimmedLine);
+                if (headingPath) {
+                    currentSourcePath = headingPath;
+                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
                     linesToKeep.push(line); // Keep headings
                     continue;
                 }
