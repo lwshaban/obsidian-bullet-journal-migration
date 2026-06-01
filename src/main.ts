@@ -16,7 +16,7 @@ import {
 } from './timeTracking';
 import { WeeklyPlannerModal } from './planner';
 import { MigrationPickerModal } from './migration-ui';
-import { PlanningWorkspaceView, VIEW_TYPE_PLANNING } from './planning-view';
+import { PlanningWorkspaceView, VIEW_TYPE_PLANNING } from './views/PlanningView';
 
 export default class BujoMigrationPlugin extends Plugin {
 	settings: BujoPluginSettings;
