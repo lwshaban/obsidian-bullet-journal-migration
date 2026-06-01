@@ -38,17 +38,6 @@ function minToTimeStr(startMin: number, endMin: number): string {
 	return `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}-${String(eh).padStart(2,'0')}:${String(em).padStart(2,'0')}`;
 }
 
-/** Generate a short deterministic hash from task text (content-based, survives across files) */
-function taskHash(taskText: string): string {
-	let hash = 0;
-	for (let i = 0; i < taskText.length; i++) {
-		const ch = taskText.charCodeAt(i);
-		hash = ((hash << 5) - hash) + ch;
-		hash |= 0;
-	}
-	return Math.abs(hash).toString(36).slice(0, 6);
-}
-
 function parseTimeToMin(range: string): { startMin: number; endMin: number; minutes: number } | null {
 	const parsed = parseTimeRange(range);
 	if (!parsed) return null;
@@ -717,7 +706,6 @@ export class PlanningWorkspaceView extends ItemView {
 	}
 
 	private async persistBlock(block: PlannedBlock, previousDay?: number) {
-		const hash = taskHash(block.taskText);
 		const dayDate = this.weekStart.clone().add(block.day, 'days').format('YYYY-MM-DD');
 		const filePath = `Journal/001 Daily Notes/${dayDate}.md`;
 
@@ -725,7 +713,7 @@ export class PlanningWorkspaceView extends ItemView {
 		if (previousDay !== undefined && previousDay !== block.day) {
 			const oldDate = this.weekStart.clone().add(previousDay, 'days').format('YYYY-MM-DD');
 			const oldPath = `Journal/001 Daily Notes/${oldDate}.md`;
-			await this.removeBlockFromFile(oldPath, hash, block.startMin, block.endMin);
+			await this.removeBlockFromFile(oldPath, block.taskText, block.startMin, block.endMin);
 		}
 
 		// ── Write to new day ──
@@ -745,46 +733,32 @@ export class PlanningWorkspaceView extends ItemView {
 		const norm = normalizeText(block.taskText);
 		let parentIdx = -1, parentIndent = 0;
 
-		// Find parent by hash or text
+		// Find parent by text
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
 			if (!line) continue;
-			// Match by hash comment
-			if (line.includes(`<!-- bujo:${hash} -->`)) {
-				parentIdx = i;
-				parentIndent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
-				break;
-			}
-		}
-
-		// Fallback: match by text
-		if (parentIdx === -1) {
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				if (!line) continue;
-				const trimmed = line.trim();
-				if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
-				if (/^\s*- \[/.test(line)) {
-					const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
-					const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
-					if (normalizeText(text) === norm && (parentIdx === -1 || indent <= parentIndent)) {
-						parentIdx = i;
-						parentIndent = indent;
-						break;
-					}
+			const trimmed = line.trim();
+			if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
+			if (/^\s*- \[/.test(line)) {
+				const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
+				// Strip any existing HTML comments from text comparison
+				const cleanText = text.replace(/<!--.*?-->/, '').trim();
+				const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
+				if (normalizeText(cleanText) === norm && (parentIdx === -1 || indent <= parentIndent)) {
+					parentIdx = i;
+					parentIndent = indent;
+					break;
 				}
 			}
 		}
 
 		if (parentIdx === -1) {
-			// Create parent task with hash ID
-			lines.push(`- [ ] ${block.taskText} <!-- bujo:${hash} -->`);
+			// Create parent task (no visible ID, hash is computed on read)
+			lines.push(`- [ ] ${block.taskText}`);
 			lines.push(blockLine);
 		} else {
-			// Ensure parent has hash ID
-			if (!lines[parentIdx]!.includes('<!-- bujo:')) {
-				lines[parentIdx] = lines[parentIdx]!.trimEnd() + ` <!-- bujo:${hash} -->`;
-			}
+			// Clean any legacy HTML comments from parent line
+			lines[parentIdx] = lines[parentIdx]!.replace(/\s*<!--\s*bujo:[^>]*\s*-->/, '');
 
 			// Check if a block with this time already exists — replace it
 			let replaced = false;
@@ -793,7 +767,6 @@ export class PlanningWorkspaceView extends ItemView {
 				if (!li || !li.trim()) continue;
 				const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
 				if (indent <= parentIndent) break;
-				// Match by same time range
 				if (li.includes('[@]') && li.includes(timeStr)) {
 					lines[i] = blockLine;
 					replaced = true;
@@ -817,22 +790,30 @@ export class PlanningWorkspaceView extends ItemView {
 		block.sourceFile = filePath;
 	}
 
-	/** Remove a specific [@] block from a file by finding the parent task hash and matching the time range */
-	private async removeBlockFromFile(filePath: string, hash: string, startMin: number, endMin: number) {
+	/** Remove a specific [@] block from a file by matching task text + time range */
+	private async removeBlockFromFile(filePath: string, taskText: string, startMin: number, endMin: number) {
 		const file = this.app.vault.getAbstractFileByPath(filePath);
 		if (!(file instanceof TFile)) return;
 
 		const content = await this.app.vault.read(file);
 		const lines = content.split('\n');
 		const timeStr = minToTimeStr(startMin, endMin);
+		const norm = normalizeText(taskText);
 
-		// Find parent by hash
+		// Find parent by text
 		let parentIdx = -1, parentIndent = 0;
 		for (let i = 0; i < lines.length; i++) {
-			if (lines[i]?.includes(`<!-- bujo:${hash} -->`)) {
-				parentIdx = i;
-				parentIndent = (lines[i]?.match(/^(\s*)/)?.[1]?.length) || 0;
-				break;
+			const line = lines[i];
+			if (!line) continue;
+			const trimmed = line.trim();
+			if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
+			if (/^\s*- \[/.test(line)) {
+				const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '').replace(/<!--.*?-->/, '').trim();
+				if (normalizeText(text) === norm) {
+					parentIdx = i;
+					parentIndent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
+					break;
+				}
 			}
 		}
 
@@ -854,8 +835,6 @@ export class PlanningWorkspaceView extends ItemView {
 
 	/** Delete a block from the calendar and its markdown */
 	private deleteBlock(block: PlannedBlock) {
-		const hash = taskHash(block.taskText);
-
 		// Remove from in-memory state
 		const task = this.tasks.find(t => t.task.text === block.taskText);
 		if (task) {
@@ -864,7 +843,7 @@ export class PlanningWorkspaceView extends ItemView {
 		}
 
 		// Remove from markdown
-		this.removeBlockFromFile(block.sourceFile, hash, block.startMin, block.endMin);
+		this.removeBlockFromFile(block.sourceFile, block.taskText, block.startMin, block.endMin);
 
 		// Re-render
 		this.renderPool();
