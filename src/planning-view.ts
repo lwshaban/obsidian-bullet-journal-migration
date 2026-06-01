@@ -1,37 +1,41 @@
-// Planning Workspace — full-page ItemView. Calendar-first with collapsible task pool.
-// Left: tasks grouped by note. Right: week calendar. Drag tasks to schedule [@] blocks.
-// Drag block edges to resize. Registered as a ribbon icon + command.
+// Planning Workspace v2 — free-form calendar like Google Calendar.
+// Sidebar: tasks grouped by note, click to cancel/done.
+// Calendar: drag tasks to any minute position, drag blocks to move, resize edges.
+// Snaps to 15-min increments. Colored by parent task.
 
 import { ItemView, WorkspaceLeaf, TFile, moment, Notice } from 'obsidian';
 import { scanOpenTasksFull, TrackableTask, parseTimeRange } from './timeTracking';
+import { normalizeText, getTaskText, isIncompleteTask, isCompletedTask } from './utils';
 
 export const VIEW_TYPE_PLANNING = 'bujo-planning-workspace';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 interface PlannedBlock {
+	id: string;            // unique per block for drag tracking
 	taskText: string;
-	day: number;          // 0=Mon..6=Sun
-	startMin: number;     // minutes from midnight
+	day: number;           // 0=Mon..6=Sun
+	startMin: number;      // minutes from midnight
 	endMin: number;
 	durationMin: number;
 	sourceFile: string;
+	color: string;
 }
 
-interface TaskWithBlocks {
+interface TaskState {
 	task: TrackableTask;
 	blocks: PlannedBlock[];
+	done: boolean;
 }
 
-interface NoteGroup {
-	path: string;
-	label: string;        // e.g. "2026-06-01" or "Project X"
-	tasks: TaskWithBlocks[];
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function timeToMin(h: number, m: number): number { return h * 60 + m; }
+function minToTimeStr(startMin: number, endMin: number): string {
+	const sh = Math.floor(startMin / 60), sm = startMin % 60;
+	const eh = Math.floor(endMin / 60), em = endMin % 60;
+	return `${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}-${String(eh).padStart(2,'0')}:${String(em).padStart(2,'0')}`;
 }
-
-// ── Hour/minute helpers ────────────────────────────────────────────────────────
-
-function hourToMin(h: number, m: number = 0): number { return h * 60 + m; }
 
 function parseTimeToMin(range: string): { startMin: number; endMin: number; minutes: number } | null {
 	const parsed = parseTimeRange(range);
@@ -39,27 +43,31 @@ function parseTimeToMin(range: string): { startMin: number; endMin: number; minu
 	const [sh, sm] = parsed.start.split(':').map(Number);
 	const [eh, em] = parsed.end.split(':').map(Number);
 	if (sh === undefined || sm === undefined || eh === undefined || em === undefined) return null;
-	return {
-		startMin: sh * 60 + sm,
-		endMin: eh * 60 + em,
-		minutes: parsed.minutes,
-	};
+	return { startMin: sh * 60 + sm, endMin: eh * 60 + em, minutes: parsed.minutes };
 }
+
+const TASK_COLORS = [
+	'oklch(65% 0.15 35)',  'oklch(58% 0.14 270)',
+	'oklch(55% 0.08 150)', 'oklch(50% 0.10 100)',
+	'oklch(60% 0.12 200)', 'oklch(55% 0.09 310)',
+];
+let colorIdx = 0;
+function nextColor(): string { return TASK_COLORS[colorIdx++ % TASK_COLORS.length]!; }
 
 // ── The View ───────────────────────────────────────────────────────────────────
 
 export class PlanningWorkspaceView extends ItemView {
-	private tasks: TaskWithBlocks[] = [];
+	private tasks: TaskState[] = [];
 	private weekStart: moment.Moment;
 	private calendarEl!: HTMLElement;
 	private poolEl!: HTMLElement;
 	private sidebarVisible = true;
-	private draggedTask: TaskWithBlocks | null = null;
 
-	// Layout constants
-	private readonly HOUR_HEIGHT = 52;
-	private readonly START_HOUR = 6;
-	private readonly END_HOUR = 22;
+	// Layout
+	private readonly HOUR_HEIGHT = 56;
+	private readonly START_HOUR = 5;
+	private readonly END_HOUR = 23;
+	private readonly SNAP_MIN = 15; // snap to 15-min increments
 
 	constructor(leaf: WorkspaceLeaf) {
 		super(leaf);
@@ -75,67 +83,57 @@ export class PlanningWorkspaceView extends ItemView {
 		container.empty();
 		container.style.cssText = 'display:flex;flex-direction:column;height:100%;overflow:hidden;';
 
-		// ── Header bar ──
-		const header = container.createDiv();
-		header.style.cssText = `
-			display:flex; align-items:center; justify-content:space-between;
-			padding:8px 14px; background:var(--background-primary);
-			border-bottom:1px solid var(--background-modifier-border);
-			flex-shrink:0;
-		`;
+		// ── Header ──
+		const hdr = container.createDiv();
+		hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 14px;border-bottom:1px solid var(--background-modifier-border);flex-shrink:0;background:var(--background-primary);';
 
 		const weekEnd = this.weekStart.clone().add(6, 'days');
-		const titleEl = header.createEl('div', {
-			text: `${this.weekStart.format('MMM D')} – ${weekEnd.format('MMM D, YYYY')}`,
-		});
-		titleEl.style.cssText = 'font-size:16px;font-weight:600;';
+		hdr.createEl('div', { text: `${this.weekStart.format('MMM D')} – ${weekEnd.format('MMM D, YYYY')}` }).style.cssText = 'font-size:15px;font-weight:600;';
 
-		const navRow = header.createDiv();
-		navRow.style.cssText = 'display:flex;gap:6px;align-items:center;';
+		const btns = hdr.createDiv();
+		btns.style.cssText = 'display:flex;gap:6px;';
 
-		// Toggle sidebar
-		const toggleBtn = navRow.createEl('button', { text: '☰ Tasks' });
-		toggleBtn.style.cssText = this.btnStyle();
-		toggleBtn.onclick = () => {
-			this.sidebarVisible = !this.sidebarVisible;
-			this.poolEl.style.display = this.sidebarVisible ? '' : 'none';
-			this.renderCalendar();
-		};
+		const toggleBtn = btns.createEl('button', { text: '☰' });
+		toggleBtn.style.cssText = this.btnCss();
+		toggleBtn.title = 'Toggle sidebar';
+		toggleBtn.onclick = () => { this.sidebarVisible = !this.sidebarVisible; this.poolEl.style.display = this.sidebarVisible ? '' : 'none'; this.renderCalendar(); };
 
-		['←', 'Today', '→'].forEach((label, i) => {
-			const btn = navRow.createEl('button', { text: label });
-			btn.style.cssText = this.btnStyle();
-			if (i === 0) btn.onclick = () => { this.weekStart.subtract(1, 'week'); this.reload(); };
-			if (i === 1) btn.onclick = () => { this.weekStart = moment().startOf('isoWeek'); this.reload(); };
-			if (i === 2) btn.onclick = () => { this.weekStart.add(1, 'week'); this.reload(); };
-		});
+		for (const [label, fn] of [['←', () => { this.weekStart.subtract(1,'week'); this.reload(); }], ['Today', () => { this.weekStart = moment().startOf('isoWeek'); this.reload(); }], ['→', () => { this.weekStart.add(1,'week'); this.reload(); }]] as const) {
+			const b = btns.createEl('button', { text: label });
+			b.style.cssText = this.btnCss();
+			b.onclick = fn;
+		}
 
-		// ── Body: sidebar + calendar ──
+		// ── Body ──
 		const body = container.createDiv();
 		body.style.cssText = 'display:flex;flex:1;overflow:hidden;';
 
-		this.poolEl = body.createDiv({ cls: 'bujo-pool' });
-		this.poolEl.style.cssText = 'width:260px;border-right:1px solid var(--background-modifier-border);overflow-y:auto;padding:10px;flex-shrink:0;';
+		this.poolEl = body.createDiv();
+		this.poolEl.style.cssText = 'width:250px;border-right:1px solid var(--background-modifier-border);overflow-y:auto;padding:8px;flex-shrink:0;';
 
-		this.calendarEl = body.createDiv({ cls: 'bujo-cal' });
+		this.calendarEl = body.createDiv();
 		this.calendarEl.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;position:relative;';
 
 		await this.reload();
 	}
 
-	private btnStyle(): string {
+	private btnCss(): string {
 		return 'padding:4px 10px;border:1px solid var(--background-modifier-border);border-radius:5px;cursor:pointer;background:var(--background-primary);font-size:12px;color:var(--text-normal);';
 	}
 
-	// ── Data loading ────────────────────────────────────────────────────────────
+	// ── Data ────────────────────────────────────────────────────────────────────
 
 	private async reload() {
+		colorIdx = 0;
 		const rawTasks = await scanOpenTasksFull(this.app);
 		const plannedBlocks = await this.collectWeekBlocks();
+		const taskColors = new Map<string, string>();
 
 		this.tasks = rawTasks.map(t => {
-			const blocks = plannedBlocks.filter(b => b.taskText === t.text);
-			return { task: t, blocks };
+			if (!taskColors.has(t.text)) taskColors.set(t.text, nextColor());
+			const color = taskColors.get(t.text)!;
+			const blocks = plannedBlocks.filter(b => b.taskText === t.text).map(b => ({ ...b, color }));
+			return { task: t, blocks, done: false };
 		});
 
 		this.tasks.sort((a, b) => {
@@ -150,6 +148,7 @@ export class PlanningWorkspaceView extends ItemView {
 
 	private async collectWeekBlocks(): Promise<PlannedBlock[]> {
 		const results: PlannedBlock[] = [];
+		let idCounter = 0;
 
 		for (let d = 0; d < 7; d++) {
 			const dayDate = this.weekStart.clone().add(d, 'days').format('YYYY-MM-DD');
@@ -159,50 +158,40 @@ export class PlanningWorkspaceView extends ItemView {
 
 			const content = await this.app.vault.read(file);
 			const lines = content.split('\n');
-
-			let currentParent: string | null = null;
-			let currentParentIndent = -1;
+			let parent: string | null = null, parentIndent = -1;
 
 			for (const line of lines) {
 				if (!line) continue;
 				const trimmed = line.trim();
-
-				const plannedMatch = trimmed.match(/^-\s*\[@\]\s+(\d{1,2}:\d{2}-\d{1,2}:\d{2})/);
-				if (plannedMatch && plannedMatch[1] && currentParent) {
-					const t = parseTimeToMin(plannedMatch[1]);
+				const m = trimmed.match(/^-\s*\[@\]\s+(\d{1,2}:\d{2}-\d{1,2}:\d{2})/);
+				if (m && m[1] && parent) {
+					const t = parseTimeToMin(m[1]);
 					if (t) {
-						results.push({
-							taskText: currentParent,
-							day: d,
-							startMin: t.startMin,
-							endMin: t.endMin,
-							durationMin: t.minutes,
-							sourceFile: filePath,
-						});
+						results.push({ id: `b${idCounter++}`, taskText: parent, day: d, startMin: t.startMin, endMin: t.endMin, durationMin: t.minutes, sourceFile: filePath, color: '' });
 					}
 					continue;
 				}
-
 				if (/^\s*- \[/.test(line) && !trimmed.startsWith('- [@]') && !trimmed.startsWith('- [t]')) {
 					const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
-					if (currentParent === null || indent <= currentParentIndent) {
-						currentParent = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
-						currentParentIndent = indent;
+					if (parent === null || indent <= parentIndent) {
+						parent = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
+						parentIndent = indent;
 					}
 				}
 			}
 		}
-
 		return results;
 	}
 
-	// ── Task pool ───────────────────────────────────────────────────────────────
+	// ── Sidebar ─────────────────────────────────────────────────────────────────
 
 	private renderPool() {
 		this.poolEl.empty();
 
-		// Group by note
-		const groups = new Map<string, TaskWithBlocks[]>();
+		const search = this.poolEl.createEl('input', { type: 'text', placeholder: 'Filter...' }) as HTMLInputElement;
+		search.style.cssText = 'width:100%;padding:5px 8px;border:1px solid var(--background-modifier-border);border-radius:5px;margin-bottom:8px;font-size:12px;background:var(--background-primary);color:var(--text-normal);box-sizing:border-box;';
+
+		const groups = new Map<string, TaskState[]>();
 		for (const t of this.tasks) {
 			const label = this.noteLabel(t.task.file);
 			if (!groups.has(label)) groups.set(label, []);
@@ -210,281 +199,293 @@ export class PlanningWorkspaceView extends ItemView {
 		}
 
 		for (const [label, groupTasks] of groups) {
-			// Note header
-			const header = this.poolEl.createDiv();
-			header.style.cssText = 'font-size:10px;text-transform:uppercase;color:var(--text-muted);letter-spacing:1px;margin:10px 0 6px;padding:2px 6px;';
-			header.textContent = label;
+			const hdr = this.poolEl.createDiv();
+			hdr.style.cssText = 'font-size:10px;text-transform:uppercase;color:var(--text-muted);letter-spacing:1px;margin:8px 0 4px;padding:2px 4px;';
+			hdr.textContent = label;
 
 			for (const task of groupTasks) {
-				const card = this.poolEl.createDiv({ cls: 'bujo-task-card' });
-				card.style.cssText = `
-					padding:6px 8px; margin-bottom:3px; border-radius:5px;
-					cursor:grab; font-size:12px; line-height:1.4;
-					border:1px solid var(--background-modifier-border);
-					background:var(--background-primary);
-					${task.blocks.length > 0 ? 'opacity:0.55;' : ''}
-				`;
-				card.textContent = task.task.text.slice(0, 70);
+				const row = this.poolEl.createDiv();
+				row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 4px;margin-bottom:2px;border-radius:4px;font-size:12px;cursor:pointer;';
+				row.onmouseenter = () => row.style.background = 'var(--background-modifier-hover)';
+				row.onmouseleave = () => row.style.background = '';
 
+				// Checkbox for done/cancel
+				const cb = row.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+				cb.style.cssText = 'margin:0;flex-shrink:0;';
+				cb.checked = task.done;
+				cb.onchange = async () => {
+					task.done = cb.checked;
+					await this.toggleTaskDone(task);
+					this.renderPool();
+				};
+
+				// Task text
+				const textEl = row.createEl('span');
+				textEl.style.cssText = `flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${task.done ? 'text-decoration:line-through;color:var(--text-faint);' : ''}`;
+				textEl.textContent = task.task.text.slice(0, 60);
+
+				// Block count
 				if (task.blocks.length > 0) {
-					const dur = task.blocks.reduce((s, b) => s + b.durationMin, 0);
+					const dur = task.blocks.reduce((s,b) => s + b.durationMin, 0);
 					const h = Math.floor(dur / 60), m = dur % 60;
-					card.createEl('div', {
-						text: `${task.blocks.length} block${task.blocks.length > 1 ? 's' : ''} · ${h > 0 ? `${h}h ` : ''}${m}m`,
-					}).style.cssText = 'font-size:9px;color:var(--text-muted);margin-top:1px;';
+					row.createEl('span', { text: `${h > 0 ? `${h}h ` : ''}${m}m` }).style.cssText = 'font-size:9px;color:var(--text-muted);flex-shrink:0;';
 				}
 
-				card.setAttribute('draggable', 'true');
-				card.ondragstart = (e) => {
-					this.draggedTask = task;
+				// Drag handle
+				row.setAttribute('draggable', 'true');
+				row.ondragstart = (e) => {
 					e.dataTransfer!.effectAllowed = 'move';
+					e.dataTransfer!.setData('text/plain', JSON.stringify({ taskText: task.task.text, sourceFile: task.task.file }));
 				};
-				card.ondragend = () => { this.draggedTask = null; };
-
-				card.onmouseenter = () => { card.style.background = 'var(--background-modifier-hover)'; };
-				card.onmouseleave = () => { card.style.background = 'var(--background-primary)'; };
 			}
 		}
+	}
 
-		if (this.tasks.length === 0) {
-			this.poolEl.createEl('div', {
-				text: 'No open tasks',
-			}).style.cssText = 'color:var(--text-muted);font-size:13px;padding:20px;text-align:center;';
+	private noteLabel(path: string): string {
+		if (path.includes('Daily Notes')) {
+			const m = path.match(/(\d{4}-\d{2}-\d{2})\.md$/);
+			if (m && m[1]) return moment(m[1]).format('ddd MMM D');
+		}
+		if (path.includes('Weekly Notes')) {
+			const m = path.match(/(\d{4}-W\d{2})\.md$/);
+			if (m && m[1]) return m[1];
+		}
+		const parts = path.split('/');
+		return (parts[parts.length - 1] ?? path).replace('.md', '').slice(0, 25);
+	}
+
+	private async toggleTaskDone(task: TaskState) {
+		const file = this.app.vault.getAbstractFileByPath(task.task.file);
+		if (!(file instanceof TFile)) return;
+
+		const content = await this.app.vault.read(file);
+		const lines = content.split('\n');
+		const norm = normalizeText(task.task.text);
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			if (!line || !isIncompleteTask(line)) continue;
+			if (normalizeText(getTaskText(line)) === norm) {
+				lines[i] = line.replace(/^(\s*-\s*)\[\s\]/, '$1[-]');
+				await this.app.vault.modify(file, lines.join('\n'));
+				return;
+			}
 		}
 	}
 
-	private noteLabel(filePath: string): string {
-		// Extract display label from file path
-		if (filePath.includes('Daily Notes')) {
-			const m = filePath.match(/(\d{4}-\d{2}-\d{2})\.md$/);
-			if (m) return moment(m[1]).format('ddd MMM D');
-		}
-		if (filePath.includes('Weekly Notes')) {
-				const m = filePath.match(/(\d{4}-W\d{2})\.md$/);
-				if (m && m[1]) return m[1];
-		}
-		// Generic: use filename without extension
-		const parts = filePath.split('/');
-		const filename = parts[parts.length - 1] ?? filePath;
-		return filename.replace('.md', '').slice(0, 25);
-	}
-
-	// ── Calendar ────────────────────────────────────────────────────────────────
+	// ── Calendar rendering ──────────────────────────────────────────────────────
 
 	private renderCalendar() {
 		this.calendarEl.empty();
 
+		const TIME_LABEL = 48;
 		const totalHours = this.END_HOUR - this.START_HOUR;
-		const totalHeight = totalHours * this.HOUR_HEIGHT;
-		const timeLabelWidth = 48;
-		const gridWidth = this.calendarEl.clientWidth - timeLabelWidth;
-		const dayWidth = gridWidth / 7;
+		const totalH = totalHours * this.HOUR_HEIGHT;
+		const gridW = this.calendarEl.clientWidth - TIME_LABEL;
+		const dayW = gridW / 7;
 
 		// Day headers
-		const headerRow = this.calendarEl.createDiv();
-		headerRow.style.cssText = `
-			display:flex; position:sticky; top:0; z-index:5;
-			background:var(--background-primary);
-			border-bottom:1px solid var(--background-modifier-border);
-			padding-left:${timeLabelWidth}px;
-		`;
+		const hdrRow = this.calendarEl.createDiv();
+		hdrRow.style.cssText = `display:flex;position:sticky;top:0;z-index:5;background:var(--background-primary);border-bottom:1px solid var(--background-modifier-border);padding-left:${TIME_LABEL}px;`;
 
 		for (let d = 0; d < 7; d++) {
 			const day = this.weekStart.clone().add(d, 'days');
-			const hdr = headerRow.createDiv();
-			hdr.style.cssText = `flex:1;text-align:center;padding:6px 0;font-size:12px;font-weight:600;min-width:${dayWidth}px;`;
-			hdr.textContent = day.format('ddd D');
-
-			const isToday = day.format('YYYY-MM-DD') === moment().format('YYYY-MM-DD');
-			const isWeekend = d >= 5;
-			if (isToday) {
-				hdr.style.background = 'var(--interactive-accent)';
-				hdr.style.color = 'var(--text-on-accent)';
-				hdr.style.borderRadius = '4px';
-			} else if (isWeekend) {
-				hdr.style.background = 'var(--background-secondary)';
+			const el = hdrRow.createDiv();
+			el.style.cssText = `flex:1;text-align:center;padding:5px 0;font-size:12px;font-weight:600;`;
+			el.textContent = day.format('ddd D');
+			if (day.format('YYYY-MM-DD') === moment().format('YYYY-MM-DD')) {
+				el.style.background = 'var(--interactive-accent)'; el.style.color = 'white'; el.style.borderRadius = '4px';
 			}
 		}
 
-		// Scrollable grid area
-		const gridArea = this.calendarEl.createDiv();
-		gridArea.style.cssText = `position:relative;min-height:${totalHeight}px;padding-left:${timeLabelWidth}px;`;
+		// Grid area
+		const grid = this.calendarEl.createDiv();
+		grid.style.cssText = `position:relative;min-height:${totalH}px;padding-left:${TIME_LABEL}px;`;
 
-		// Time labels + horizontal grid lines
+		// Time labels + lines
 		for (let h = this.START_HOUR; h <= this.END_HOUR; h++) {
 			const y = (h - this.START_HOUR) * this.HOUR_HEIGHT;
+			const lbl = grid.createDiv();
+			lbl.style.cssText = `position:absolute;left:-${TIME_LABEL}px;top:${y}px;width:${TIME_LABEL - 4}px;text-align:right;font-size:10px;color:var(--text-muted);transform:translateY(-7px);padding-right:4px;`;
+			lbl.textContent = `${String(h).padStart(2,'0')}:00`;
 
-			const label = gridArea.createDiv();
-			label.style.cssText = `position:absolute;left:-${timeLabelWidth}px;top:${y}px;width:${timeLabelWidth - 4}px;text-align:right;font-size:10px;color:var(--text-muted);transform:translateY(-7px);padding-right:4px;`;
-			label.textContent = `${String(h).padStart(2, '0')}:00`;
-
-			const line = gridArea.createDiv();
-			line.style.cssText = `position:absolute;left:0;top:${y}px;right:0;height:1px;background:var(--background-modifier-border);`;
+			const ln = grid.createDiv();
+			ln.style.cssText = `position:absolute;left:0;top:${y}px;right:0;height:1px;background:var(--background-modifier-border);`;
 		}
 
-		// Day columns
+		// Day columns (drop zones with minute-level detection)
 		for (let d = 0; d < 7; d++) {
-			const col = gridArea.createDiv();
-			col.style.cssText = `
-				position:absolute; left:${d * dayWidth}px; top:0;
-				width:${dayWidth}px; height:${totalHeight}px;
-				border-right:1px solid var(--background-modifier-border);
-			`;
+			const col = grid.createDiv();
+			col.style.cssText = `position:absolute;left:${d * dayW}px;top:0;width:${dayW}px;height:${totalH}px;border-right:1px solid var(--background-modifier-border);`;
 
 			const dayIdx = d;
-			col.ondragover = (e) => {
-				e.preventDefault();
-				col.style.background = 'var(--background-modifier-hover)';
-			};
+			col.ondragover = (e) => { e.preventDefault(); col.style.background = 'var(--background-modifier-hover)'; };
 			col.ondragleave = () => { col.style.background = ''; };
 			col.ondrop = (e) => {
 				e.preventDefault();
 				col.style.background = '';
-				if (!this.draggedTask) return;
+				const data = e.dataTransfer?.getData('text/plain');
+				if (!data) return;
+
 				const rect = col.getBoundingClientRect();
 				const y = e.clientY - rect.top;
-				const startH = this.START_HOUR + Math.floor(y / this.HOUR_HEIGHT);
-				this.scheduleTask(this.draggedTask, dayIdx, startH, startH + 1);
-				this.draggedTask = null;
+				const rawMin = (y / this.HOUR_HEIGHT + this.START_HOUR) * 60;
+				const startMin = Math.round(rawMin / this.SNAP_MIN) * this.SNAP_MIN;
+				const clampedStart = Math.max(this.START_HOUR * 60, Math.min((this.END_HOUR - 1) * 60, startMin));
+				const endMin = clampedStart + 60; // 1 hour default block
+
+				try {
+					const parsed = JSON.parse(data) as { taskText: string; sourceFile: string };
+					this.createBlock(parsed.taskText, parsed.sourceFile, dayIdx, clampedStart, endMin);
+				} catch {
+					// Not JSON — try as legacy task drop
+					const task = this.tasks.find(t => t.task.text === data);
+					if (task) this.createBlock(task.task.text, task.task.file, dayIdx, clampedStart, endMin);
+				}
 			};
 		}
 
-		// Render blocks
-		const colors = this.blockColors();
+		// Render existing blocks with full drag+resize
 		for (const task of this.tasks) {
 			for (const block of task.blocks) {
-				const color = colors[block.taskText] || 'var(--interactive-accent)';
-				this.renderBlock(gridArea, block, dayWidth, color);
+				this.renderBlock(grid, block, dayW);
 			}
 		}
 
-		// Current time line
+		// Now line
 		const now = moment();
-		const nowDay = now.isoWeekday() - 1; // 0=Mon
-		const nowMin = now.hour() * 60 + now.minute();
-		const nowY = ((nowMin / 60) - this.START_HOUR) * this.HOUR_HEIGHT;
-
-		if (nowDay >= 0 && nowDay < 7 && nowY > 0 && nowY < totalHeight) {
-			const line = gridArea.createDiv();
-			line.style.cssText = `position:absolute;left:${nowDay * dayWidth}px;top:${nowY}px;width:${dayWidth}px;height:2px;background:var(--interactive-accent);z-index:8;`;
+		const nd = now.isoWeekday() - 1;
+		const ny = ((now.hour() * 60 + now.minute()) / 60 - this.START_HOUR) * this.HOUR_HEIGHT;
+		if (nd >= 0 && nd < 7 && ny > 0 && ny < totalH) {
+			const nl = grid.createDiv();
+			nl.style.cssText = `position:absolute;left:${nd * dayW}px;top:${ny}px;width:${dayW}px;height:2px;background:var(--interactive-accent);z-index:10;pointer-events:none;`;
 		}
 	}
 
-	private blockColors(): Record<string, string> {
-		// Assign distinct colors to different tasks for visual grouping
-		const palette = [
-			'oklch(65% 0.15 35)',  // terracotta
-			'oklch(58% 0.14 270)', // indigo
-			'oklch(55% 0.08 150)', // forest
-			'oklch(50% 0.10 100)', // warm
-			'oklch(60% 0.12 200)', // teal
-			'oklch(55% 0.09 310)', // plum
-		];
-		const colors: Record<string, string> = {};
-		let idx = 0;
-		for (const task of this.tasks) {
-			if (task.blocks.length > 0) {
-				colors[task.task.text] = palette[idx % palette.length]!;
-				idx++;
-			}
-		}
-		return colors;
-	}
+	// ── Block rendering with full drag + resize ─────────────────────────────────
 
-	private renderBlock(
-		container: HTMLElement,
-		block: PlannedBlock,
-		dayWidth: number,
-		color: string,
-	) {
-		const left = block.day * dayWidth + 2;
+	private renderBlock(grid: HTMLElement, block: PlannedBlock, dayW: number) {
+		const left = block.day * dayW + 2;
 		const top = ((block.startMin / 60) - this.START_HOUR) * this.HOUR_HEIGHT;
-		const height = ((block.endMin - block.startMin) / 60) * this.HOUR_HEIGHT;
+		const h = ((block.endMin - block.startMin) / 60) * this.HOUR_HEIGHT;
 
-		const el = container.createDiv({ cls: 'bujo-cal-block' });
+		const el = grid.createDiv();
 		el.style.cssText = `
 			position:absolute; left:${left}px; top:${top}px;
-			width:${dayWidth - 4}px; height:${Math.max(height, 20)}px;
-			background:${color}; color:white; border-radius:5px;
-			padding:3px 6px; font-size:10px; overflow:hidden;
-			cursor:pointer; z-index:3; opacity:0.9;
+			width:${dayW - 4}px; height:${Math.max(h, 16)}px;
+			background:${block.color}; color:white; border-radius:5px;
+			padding:2px 5px; font-size:10px; overflow:hidden;
+			cursor:grab; z-index:3; opacity:0.9;
 			box-sizing:border-box; line-height:1.3;
+			transition: box-shadow 0.1s;
 		`;
+		el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0,30)}</div><div style="opacity:0.8;">${minToTimeStr(block.startMin, block.endMin)}</div>`;
 
-		const sh = Math.floor(block.startMin / 60), sm = block.startMin % 60;
-		const eh = Math.floor(block.endMin / 60), em = block.endMin % 60;
-		const timeLabel = `${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}–${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}`;
+		// ── Drag entire block to move ──
+		let dragging = false, dragStartX = 0, dragStartY = 0, origDay = 0, origStart = 0;
 
-		el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0, 30)}</div><div style="opacity:0.8;margin-top:1px;">${timeLabel}</div>`;
-
-		// Click to unschedule
-		el.onclick = () => {
-			if (confirm(`Unschedule "${block.taskText}"?`)) {
-				this.unscheduleBlock(block);
-			}
-		};
-
-		// Resize handle
-		const handle = container.createDiv();
-		handle.style.cssText = `
-			position:absolute; left:${left}px; top:${top + height - 5}px;
-			width:${dayWidth - 4}px; height:10px; cursor:ns-resize; z-index:4;
-		`;
-
-		let resizing = false, startY = 0, startEnd = block.endMin;
-
-		handle.onmousedown = (e) => {
-			resizing = true;
-			startY = e.clientY;
-			startEnd = block.endMin;
+		el.onmousedown = (e) => {
+			if ((e.target as HTMLElement).classList.contains('bujo-resize')) return;
+			dragging = true;
+			dragStartX = e.clientX;
+			dragStartY = e.clientY;
+			origDay = block.day;
+			origStart = block.startMin;
+			el.style.zIndex = '20';
+			el.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
+			el.style.opacity = '0.7';
 			e.preventDefault();
 		};
 
 		const onMove = (e: MouseEvent) => {
-			if (!resizing) return;
-			const deltaMin = Math.round(((e.clientY - startY) / this.HOUR_HEIGHT) * 60);
-			const newEnd = Math.min(this.END_HOUR * 60, Math.max(block.startMin + 15, startEnd + deltaMin));
-			block.endMin = newEnd;
-			block.durationMin = newEnd - block.startMin;
-			el.style.height = `${Math.max(20, ((newEnd - block.startMin) / 60) * this.HOUR_HEIGHT)}px`;
+			if (!dragging) return;
+			const dx = e.clientX - dragStartX;
+			const dy = e.clientY - dragStartY;
+			const newDay = Math.max(0, Math.min(6, origDay + Math.round(dx / dayW)));
+			const deltaMin = Math.round((dy / this.HOUR_HEIGHT) * 60 / this.SNAP_MIN) * this.SNAP_MIN;
+			const ns = origStart + deltaMin;
+			const newStart = Math.max(this.START_HOUR * 60, Math.min((this.END_HOUR - 1) * 60, ns));
+			const dur = block.endMin - block.startMin;
+			block.day = newDay;
+			block.startMin = newStart;
+			block.endMin = newStart + dur;
+			el.style.left = `${newDay * dayW + 2}px`;
+			el.style.top = `${((newStart / 60) - this.START_HOUR) * this.HOUR_HEIGHT}px`;
+			el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0,30)}</div><div style="opacity:0.8;">${minToTimeStr(block.startMin, block.endMin)}</div>`;
 		};
 
 		const onUp = () => {
-			if (!resizing) return;
-			resizing = false;
+			if (!dragging) return;
+			dragging = false;
+			el.style.zIndex = '3';
+			el.style.boxShadow = '';
+			el.style.opacity = '0.9';
 			document.removeEventListener('mousemove', onMove);
 			document.removeEventListener('mouseup', onUp);
+			if (block.day !== origDay) block.sourceFile = ''; // will be re-assigned on persist
 			this.persistBlock(block);
 		};
 
 		document.addEventListener('mousemove', onMove);
 		document.addEventListener('mouseup', onUp);
-	}
 
-	// ── Actions ─────────────────────────────────────────────────────────────────
+		// ── Resize handle at bottom ──
+		const handle = grid.createDiv({ cls: 'bujo-resize' });
+		handle.style.cssText = `
+			position:absolute; left:${left}px; top:${top + h - 6}px;
+			width:${dayW - 4}px; height:12px; cursor:ns-resize; z-index:4;
+		`;
 
-	private scheduleTask(task: TaskWithBlocks, day: number, startH: number, endH: number) {
-		const block: PlannedBlock = {
-			taskText: task.task.text,
-			day,
-			startMin: startH * 60,
-			endMin: endH * 60,
-			durationMin: (endH - startH) * 60,
-			sourceFile: task.task.file,
+		let resizing = false, resizeStartY = 0, resizeOrigEnd = block.endMin;
+		handle.onmousedown = (e) => {
+			resizing = true;
+			resizeStartY = e.clientY;
+			resizeOrigEnd = block.endMin;
+			e.stopPropagation();
+			e.preventDefault();
 		};
 
-		task.blocks.push(block);
-		this.persistBlock(block);
-		this.renderPool();
-		this.renderCalendar();
+		const onResizeMove = (e: MouseEvent) => {
+			if (!resizing) return;
+			const deltaMin = Math.round(((e.clientY - resizeStartY) / this.HOUR_HEIGHT) * 60 / this.SNAP_MIN) * this.SNAP_MIN;
+			const ne = Math.max(block.startMin + 15, Math.min(this.END_HOUR * 60, resizeOrigEnd + deltaMin));
+			block.endMin = ne;
+			block.durationMin = ne - block.startMin;
+			const nh = ((ne - block.startMin) / 60) * this.HOUR_HEIGHT;
+			el.style.height = `${Math.max(nh, 16)}px`;
+			handle.style.top = `${top + nh - 6}px`;
+			el.innerHTML = `<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${block.taskText.slice(0,30)}</div><div style="opacity:0.8;">${minToTimeStr(block.startMin, block.endMin)}</div>`;
+		};
+
+		const onResizeUp = () => {
+			if (!resizing) return;
+			resizing = false;
+			document.removeEventListener('mousemove', onResizeMove);
+			document.removeEventListener('mouseup', onResizeUp);
+			this.persistBlock(block);
+		};
+
+		document.addEventListener('mousemove', onResizeMove);
+		document.addEventListener('mouseup', onResizeUp);
 	}
 
-	private unscheduleBlock(block: PlannedBlock) {
-		const task = this.tasks.find(t => t.task.text === block.taskText);
-		if (task) {
-			const idx = task.blocks.indexOf(block);
-			if (idx !== -1) task.blocks.splice(idx, 1);
+	// ── Block persistence ───────────────────────────────────────────────────────
+
+	private createBlock(taskText: string, sourceFile: string, day: number, startMin: number, endMin: number) {
+		const color = this.tasks.find(t => t.task.text === taskText)?.blocks[0]?.color || nextColor();
+		const block: PlannedBlock = {
+			id: `b${Date.now()}`, taskText, day, startMin, endMin,
+			durationMin: endMin - startMin, sourceFile, color,
+		};
+
+		let task = this.tasks.find(t => t.task.text === taskText);
+		if (!task) {
+			task = { task: { text: taskText, file: sourceFile, line: '' }, blocks: [], done: false };
+			this.tasks.push(task);
 		}
+		task.blocks.push(block);
+
+		this.persistBlock(block);
 		this.renderPool();
 		this.renderCalendar();
 	}
@@ -495,63 +496,68 @@ export class PlanningWorkspaceView extends ItemView {
 
 		let file = this.app.vault.getAbstractFileByPath(filePath);
 		if (!(file instanceof TFile)) {
-			const folder = this.app.vault.getAbstractFileByPath('Journal/001 Daily Notes');
-			if (!folder) await this.app.vault.createFolder('Journal/001 Daily Notes');
+			const f = this.app.vault.getAbstractFileByPath('Journal/001 Daily Notes');
+			if (!f) await this.app.vault.createFolder('Journal/001 Daily Notes');
 			file = await this.app.vault.create(filePath, '');
 		}
 		if (!(file instanceof TFile)) return;
 
 		const content = await this.app.vault.read(file);
 		const lines = content.split('\n');
+		const timeStr = minToTimeStr(block.startMin, block.endMin);
+		const newLine = `\t- [@] ${timeStr}`;
 
-		const sh = Math.floor(block.startMin / 60), sm = block.startMin % 60;
-		const eh = Math.floor(block.endMin / 60), em = block.endMin % 60;
-		const timeStr = `${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}-${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}`;
-		const trackedLine = `\t- [@] ${timeStr}`;
-
-		const normalizedTask = block.taskText.toLowerCase().trim();
-		let parentIndex = -1;
+		const norm = normalizeText(block.taskText);
+		let parentIdx = -1, parentIndent = 0;
 
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (!line || !/^\s*- \[/.test(line.trim())) continue;
-			const text = line.trim().replace(/^-\s*\[[^\]]*\]\s*/, '').toLowerCase();
-			if (text === normalizedTask) { parentIndex = i; break; }
+			if (!line) continue;
+			const trimmed = line.trim();
+			if (trimmed.startsWith('- [@]') || trimmed.startsWith('- [t]')) continue;
+			if (/^\s*- \[/.test(line)) {
+				const text = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, '');
+				const indent = (line.match(/^(\s*)/)?.[1]?.length) || 0;
+				if (normalizeText(text) === norm && (parentIdx === -1 || indent <= parentIndent)) {
+					parentIdx = i;
+					parentIndent = indent;
+					break;
+				}
+			}
 		}
 
-		if (parentIndex === -1) {
+		if (parentIdx === -1) {
 			lines.push(`- [ ] ${block.taskText}`);
-			lines.push(trackedLine);
+			lines.push(newLine);
 		} else {
-			const parentIndent = (lines[parentIndex]?.match(/^(\s*)/)?.[1]?.length) || 0;
-
-			// Replace existing [@] block at this time, or insert
+			// Replace existing [@] for this block or insert
 			let replaced = false;
-			for (let i = parentIndex + 1; i < lines.length; i++) {
+			for (let i = parentIdx + 1; i < lines.length; i++) {
 				const li = lines[i];
 				if (!li || !li.trim()) continue;
 				const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
 				if (indent <= parentIndent) break;
-				if (li.includes('[@]') && li.includes(block.taskText.slice(0, 15))) {
-					lines[i] = trackedLine;
+				// Match by task text substring
+				if (li.includes('[@]') && normalizeText(li).includes(norm.slice(0, 15))) {
+					lines[i] = newLine;
 					replaced = true;
 					break;
 				}
 			}
-
 			if (!replaced) {
-				let insertIdx = parentIndex + 1;
-				for (let i = parentIndex + 1; i < lines.length; i++) {
+				let insert = parentIdx + 1;
+				for (let i = parentIdx + 1; i < lines.length; i++) {
 					const li = lines[i];
-					if (!li || !li.trim()) { insertIdx = i + 1; continue; }
+					if (!li || !li.trim()) { insert = i + 1; continue; }
 					const indent = (li.match(/^(\s*)/)?.[1]?.length) || 0;
-					if (indent <= parentIndent) { insertIdx = i; break; }
-					insertIdx = i + 1;
+					if (indent <= parentIndent) { insert = i; break; }
+					insert = i + 1;
 				}
-				lines.splice(insertIdx, 0, trackedLine);
+				lines.splice(insert, 0, newLine);
 			}
 		}
 
 		await this.app.vault.modify(file, lines.join('\n'));
+		block.sourceFile = filePath;
 	}
 }
