@@ -199,81 +199,183 @@ export class PlanningWorkspaceView extends ItemView {
 
 	private renderPool() {
 		this.poolEl.empty();
+		this.poolEl.style.cssText = 'width:290px;border-right:1px solid var(--background-modifier-border);overflow-y:auto;padding:0;flex-shrink:0;background:var(--background-secondary);';
 
-		const search = this.poolEl.createEl('input', { type: 'text', placeholder: 'Filter...' }) as HTMLInputElement;
-		search.style.cssText = 'width:100%;padding:5px 8px;border:1px solid var(--background-modifier-border);border-radius:5px;margin-bottom:8px;font-size:12px;background:var(--background-primary);color:var(--text-normal);box-sizing:border-box;';
+		// Search bar
+		const searchBar = this.poolEl.createDiv();
+		searchBar.style.cssText = 'position:sticky;top:0;z-index:5;padding:10px;background:var(--background-secondary);border-bottom:1px solid var(--background-modifier-border);';
+		const search = searchBar.createEl('input', { type: 'text', placeholder: 'Filter tasks...' }) as HTMLInputElement;
+		search.style.cssText = 'width:100%;padding:7px 10px;border:1px solid var(--background-modifier-border);border-radius:6px;font-size:12px;background:var(--background-primary);color:var(--text-normal);box-sizing:border-box;';
 
+		// Group tasks
+		const scheduled = this.tasks.filter(t => t.blocks.length > 0 && !t.done);
+		const unscheduled = this.tasks.filter(t => t.blocks.length === 0 && !t.done);
+		const done = this.tasks.filter(t => t.done);
+
+		// ── Scheduled section ──
+		if (scheduled.length > 0) {
+			this.renderSection('📅 Scheduled', scheduled, search);
+		}
+
+		// ── Needs review section ──
+		this.renderSection('Needs review', unscheduled, search);
+
+		// ── Done section (collapsed by default) ──
+		if (done.length > 0) {
+			this.renderSection('Done', done, search, true);
+		}
+	}
+
+	private renderSection(title: string, tasks: TaskState[], searchInput: HTMLInputElement, collapsed = false) {
+		const section = this.poolEl.createDiv();
+
+		// Section header
+		const header = section.createDiv();
+		header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 12px 6px;cursor:pointer;user-select:none;';
+		const headerLeft = header.createDiv();
+		headerLeft.style.cssText = 'display:flex;align-items:center;gap:6px;';
+		headerLeft.createEl('span', { text: title }).style.cssText = 'font-size:11px;font-weight:600;text-transform:uppercase;color:var(--text-muted);letter-spacing:0.5px;';
+		headerLeft.createEl('span', { text: String(tasks.length) }).style.cssText = 'font-size:10px;color:var(--text-faint);background:var(--background-modifier-border);padding:1px 6px;border-radius:99px;';
+
+		let collapsedState = collapsed;
+		const toggle = header.createEl('span', { text: collapsedState ? '▸' : '▾' });
+		toggle.style.cssText = 'font-size:10px;color:var(--text-muted);';
+
+		// Task list container
+		const list = section.createDiv();
+		list.style.cssText = collapsedState ? 'display:none;' : '';
+
+		header.onclick = () => {
+			collapsedState = !collapsedState;
+			toggle.textContent = collapsedState ? '▸' : '▾';
+			list.style.display = collapsedState ? 'none' : '';
+		};
+
+		if (tasks.length === 0) {
+			const empty = list.createDiv({ text: 'No tasks' });
+			empty.style.cssText = 'padding:12px;font-size:12px;color:var(--text-faint);text-align:center;';
+			return;
+		}
+
+		// Group by source note
 		const groups = new Map<string, TaskState[]>();
-		for (const t of this.tasks) {
+		for (const t of tasks) {
 			const label = this.noteLabel(t.task.file);
 			if (!groups.has(label)) groups.set(label, []);
 			groups.get(label)!.push(t);
 		}
 
 		for (const [label, groupTasks] of groups) {
-			const hdr = this.poolEl.createDiv();
-			hdr.style.cssText = 'font-size:10px;text-transform:uppercase;color:var(--text-muted);letter-spacing:1px;margin:8px 0 4px;padding:2px 4px;';
-			hdr.textContent = label;
+			const noteHeader = list.createDiv();
+			noteHeader.style.cssText = 'font-size:10px;color:var(--text-faint);padding:8px 12px 2px;';
+			noteHeader.textContent = label;
 
 			for (const task of groupTasks) {
-				const row = this.poolEl.createDiv();
-				row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 4px;margin-bottom:2px;border-radius:4px;font-size:12px;cursor:pointer;';
-				row.onmouseenter = () => row.style.background = 'var(--background-modifier-hover)';
-				row.onmouseleave = () => row.style.background = '';
+				const card = this.renderTaskCard(task, list);
 
-				// Checkbox for done/cancel
-				const cb = row.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
-				cb.style.cssText = 'margin:0;flex-shrink:0;';
-				cb.checked = task.done;
-				cb.onchange = async () => {
-					task.done = cb.checked;
-					await this.toggleTaskDone(task);
-					this.renderPool();
-				};
-
-				// Task text — click to open migration picker
-				const textEl = row.createEl('span');
-				textEl.style.cssText = `flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${task.done ? 'text-decoration:line-through;color:var(--text-faint);' : 'color:var(--text-accent);cursor:pointer;'}`;
-				textEl.textContent = task.task.text.slice(0, 60);
-				textEl.title = 'Click to migrate this task';
-				textEl.onclick = async (e) => {
-					e.stopPropagation();
-					const file = this.app.vault.getAbstractFileByPath(task.task.file);
-					if (file instanceof TFile) {
-						const leaf = this.app.workspace.getLeaf(false);
-						await leaf.openFile(file);
-						// Find the line with this task and set cursor
-						const editor = this.app.workspace.activeEditor?.editor;
-						if (editor) {
-							const content = await this.app.vault.read(file);
-							const lines = content.split('\n');
-							const norm = normalizeText(task.task.text);
-							for (let i = 0; i < lines.length; i++) {
-								if (normalizeText(getTaskText(lines[i] || '')) === norm) {
-									editor.setCursor({ line: i, ch: 0 });
-									break;
-								}
-							}
-							new MigrationPickerModal(this.app, editor).open();
-						}
-					}
-				};
-
-				// Block count
-				if (task.blocks.length > 0) {
-					const dur = task.blocks.reduce((s,b) => s + b.durationMin, 0);
-					const h = Math.floor(dur / 60), m = dur % 60;
-					row.createEl('span', { text: `${h > 0 ? `${h}h ` : ''}${m}m` }).style.cssText = 'font-size:9px;color:var(--text-muted);flex-shrink:0;';
-				}
-
-				// Drag handle
-				row.setAttribute('draggable', 'true');
-				row.ondragstart = (e) => {
-					e.dataTransfer!.effectAllowed = 'move';
-					e.dataTransfer!.setData('text/plain', JSON.stringify({ taskText: task.task.text, sourceFile: task.task.file }));
+				// Search filter
+				searchInput.oninput = () => {
+					const q = searchInput.value.toLowerCase();
+					const match = task.task.text.toLowerCase().includes(q);
+					card.style.display = match ? '' : 'none';
+					// Also hide note header if all tasks hidden
 				};
 			}
 		}
+	}
+
+	private renderTaskCard(task: TaskState, parent: HTMLElement): HTMLElement {
+		const card = parent.createDiv({ cls: 'bujo-task-card' });
+		card.style.cssText = `
+			margin:1px 10px; padding:8px 10px; border-radius:6px;
+			cursor:grab; font-size:13px; line-height:1.4;
+			border:1px solid transparent;
+			background:var(--background-primary);
+			transition: all 0.12s;
+			${task.done ? 'opacity:0.5;' : ''}
+		`;
+
+		// Color dot (matches calendar block color)
+		if (task.blocks.length > 0 && task.blocks[0]) {
+			const dot = card.createDiv();
+			dot.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:99px;background:${task.blocks[0].color};margin-right:6px;flex-shrink:0;float:left;margin-top:5px;`;
+		}
+
+		// Task text
+		const textEl = card.createEl('div');
+		textEl.style.cssText = `
+			margin-bottom:4px;
+			${task.done ? 'text-decoration:line-through;color:var(--text-faint);' : 'color:var(--text-normal);'}
+		`;
+		textEl.textContent = task.task.text.slice(0, 80);
+
+		// Meta row: source + block count
+		const meta = card.createEl('div');
+		meta.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:10px;color:var(--text-muted);';
+		meta.createEl('span', { text: this.noteLabel(task.task.file) }).style.cssText = 'opacity:0.7;';
+
+		if (task.blocks.length > 0) {
+			const dur = task.blocks.reduce((s,b) => s + b.durationMin, 0);
+			const h = Math.floor(dur / 60), m = dur % 60;
+			meta.createEl('span', { text: `${task.blocks.length} block${task.blocks.length>1?'s':''} · ${h>0?`${h}h`:''}${m}m` }).style.cssText = 'font-weight:500;';
+		}
+
+		// Action buttons on hover
+		const actions = card.createDiv({ cls: 'bujo-card-actions' });
+		actions.style.cssText = 'display:none;gap:4px;margin-top:6px;';
+
+		// Migrate button
+		const migrateBtn = actions.createEl('button', { text: '→ Migrate' });
+		migrateBtn.style.cssText = 'padding:3px 8px;border:1px solid var(--interactive-accent);border-radius:4px;font-size:10px;font-weight:500;color:var(--interactive-accent);background:transparent;cursor:pointer;';
+		migrateBtn.onclick = (e) => { e.stopPropagation(); this.openMigrationPicker(task); };
+
+		// Done/cancel button
+		const doneBtn = actions.createEl('button', { text: task.done ? '↩ Restore' : '✓ Done' });
+		doneBtn.style.cssText = 'padding:3px 8px;border:1px solid var(--background-modifier-border);border-radius:4px;font-size:10px;color:var(--text-muted);background:transparent;cursor:pointer;';
+		doneBtn.onclick = async (e) => {
+			e.stopPropagation();
+			task.done = !task.done;
+			await this.toggleTaskDone(task);
+			this.renderPool();
+		};
+
+		// Show actions on hover
+		card.onmouseenter = () => { card.style.borderColor = 'var(--background-modifier-border)'; actions.style.display = 'flex'; };
+		card.onmouseleave = () => { card.style.borderColor = 'transparent'; actions.style.display = 'none'; };
+
+		// Click card → open migration picker
+		card.onclick = () => this.openMigrationPicker(task);
+
+		// Drag handle
+		card.setAttribute('draggable', 'true');
+		card.ondragstart = (e) => {
+			e.dataTransfer!.effectAllowed = 'move';
+			e.dataTransfer!.setData('text/plain', JSON.stringify({ taskText: task.task.text, sourceFile: task.task.file }));
+		};
+
+		return card;
+	}
+
+	private async openMigrationPicker(task: TaskState) {
+		const file = this.app.vault.getAbstractFileByPath(task.task.file);
+		if (!(file instanceof TFile)) return;
+
+		const leaf = this.app.workspace.getLeaf(false);
+		await leaf.openFile(file);
+		const editor = this.app.workspace.activeEditor?.editor;
+		if (!editor) return;
+
+		// Set cursor on the task line
+		const content = await this.app.vault.read(file);
+		const lines = content.split('\n');
+		const norm = normalizeText(task.task.text);
+		for (let i = 0; i < lines.length; i++) {
+			if (normalizeText(getTaskText(lines[i] || '')) === norm) {
+				editor.setCursor({ line: i, ch: 0 });
+				break;
+			}
+		}
+		new MigrationPickerModal(this.app, editor).open();
 	}
 
 	private noteLabel(path: string): string {
