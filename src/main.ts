@@ -16,6 +16,7 @@ import {
 } from './timeTracking';
 import { WeeklyPlannerModal } from './planner';
 import { MigrationPickerModal } from './migration-ui';
+import { PlanningWorkspaceView, VIEW_TYPE_PLANNING } from './planning-view';
 
 export default class BujoMigrationPlugin extends Plugin {
 	settings: BujoPluginSettings;
@@ -28,6 +29,17 @@ export default class BujoMigrationPlugin extends Plugin {
 
 		// Initialize the Bujo migration system
 		this.bujo = new BulletJournalMigration(this.app);
+
+		// Register planning workspace view
+		this.registerView(
+			VIEW_TYPE_PLANNING,
+			(leaf) => new PlanningWorkspaceView(leaf)
+		);
+
+		// Ribbon icon to open planning workspace
+		this.addRibbonIcon('calendar-days', 'Bujo Planning', () => {
+			this.activateView();
+		});
 
 		// Register all commands
 		this.registerCommands();
@@ -66,8 +78,14 @@ export default class BujoMigrationPlugin extends Plugin {
 		// ── Time tracking ──
 
 		this.addCommand({
+			id: 'bujo-open-planning',
+			name: 'Open planning workspace',
+			callback: () => this.activateView(),
+		});
+
+		this.addCommand({
 			id: 'bujo-plan-week',
-			name: 'Plan week (calendar)',
+			name: 'Plan week (quick calendar)',
 			callback: () => new WeeklyPlannerModal(this.app).open(),
 		});
 
@@ -290,6 +308,22 @@ export default class BujoMigrationPlugin extends Plugin {
 		if (file instanceof TFile) await this.app.workspace.getLeaf().openFile(file);
 
 		new Notice(`Scoreboard: ${formatMinutes(totalTracked)} tracked this week`);
+	}
+
+	// ── Planning workspace ──
+
+	async activateView() {
+		const { workspace } = this.app;
+
+		let leaf = workspace.getLeavesOfType(VIEW_TYPE_PLANNING)[0];
+		if (!leaf) {
+			const rightLeaf = workspace.getRightLeaf(false);
+			if (rightLeaf) {
+				await rightLeaf.setViewState({ type: VIEW_TYPE_PLANNING, active: true });
+				leaf = rightLeaf;
+			}
+		}
+		if (leaf) workspace.revealLeaf(leaf);
 	}
 
 	// ── Settings ──
