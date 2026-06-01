@@ -6,6 +6,7 @@
 import { ItemView, WorkspaceLeaf, TFile, moment, Notice } from 'obsidian';
 import { scanOpenTasksFull, TrackableTask, parseTimeRange } from './timeTracking';
 import { normalizeText, getTaskText, isIncompleteTask, isCompletedTask } from './utils';
+import { MigrationPickerModal } from './migration-ui';
 
 export const VIEW_TYPE_PLANNING = 'bujo-planning-workspace';
 
@@ -230,10 +231,33 @@ export class PlanningWorkspaceView extends ItemView {
 					this.renderPool();
 				};
 
-				// Task text
+				// Task text — click to open migration picker
 				const textEl = row.createEl('span');
-				textEl.style.cssText = `flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${task.done ? 'text-decoration:line-through;color:var(--text-faint);' : ''}`;
+				textEl.style.cssText = `flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${task.done ? 'text-decoration:line-through;color:var(--text-faint);' : 'color:var(--text-accent);cursor:pointer;'}`;
 				textEl.textContent = task.task.text.slice(0, 60);
+				textEl.title = 'Click to migrate this task';
+				textEl.onclick = async (e) => {
+					e.stopPropagation();
+					const file = this.app.vault.getAbstractFileByPath(task.task.file);
+					if (file instanceof TFile) {
+						const leaf = this.app.workspace.getLeaf(false);
+						await leaf.openFile(file);
+						// Find the line with this task and set cursor
+						const editor = this.app.workspace.activeEditor?.editor;
+						if (editor) {
+							const content = await this.app.vault.read(file);
+							const lines = content.split('\n');
+							const norm = normalizeText(task.task.text);
+							for (let i = 0; i < lines.length; i++) {
+								if (normalizeText(getTaskText(lines[i] || '')) === norm) {
+									editor.setCursor({ line: i, ch: 0 });
+									break;
+								}
+							}
+							new MigrationPickerModal(this.app, editor).open();
+						}
+					}
+				};
 
 				// Block count
 				if (task.blocks.length > 0) {
