@@ -87,49 +87,6 @@ export function collectChildTasks(
 	return children;
 }
 
-// ── Fuzzy matching ─────────────────────────────────────────────────────────────
-
-/**
- * Finds a line in an array that fuzzy-matches the given task text.
- * Used as a fallback when exact text matching fails (e.g., formatting differences).
- * Returns the matching line text and its index, or null.
- */
-export function fuzzyFindLine(
-	lines: string[],
-	targetText: string,
-	filterFn: (line: string) => boolean = () => true,
-	threshold: number = 0.7
-): { line: string; index: number; score: number } | null {
-	const normalizedTarget = normalizeText(targetText);
-	const targetWords = normalizedTarget.split(/\s+/).filter(w => w.length > 2);
-
-	if (targetWords.length === 0) return null;
-
-	let bestMatch: string | null = null;
-	let bestIndex = -1;
-	let bestScore = 0;
-
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
-		if (!line || !filterFn(line)) continue;
-
-		const lineText = getTaskText(line);
-		const normalizedLine = normalizeText(lineText);
-		const lineWords = normalizedLine.split(/\s+/).filter(w => w.length > 2);
-
-		const matchingWords = targetWords.filter(w => lineWords.includes(w)).length;
-		const score = matchingWords / Math.max(targetWords.length, lineWords.length);
-
-		if (score > bestScore && score > threshold) {
-			bestScore = score;
-			bestMatch = line;
-			bestIndex = i;
-		}
-	}
-
-	return bestMatch ? { line: bestMatch, index: bestIndex, score: bestScore } : null;
-}
-
 // ── Date / path helpers ────────────────────────────────────────────────────────
 
 /**
@@ -157,39 +114,6 @@ export function headingToSourcePath(rawHeading: string): string | null {
 		return path;
 	}
 	return null;
-}
-
-// ── Bullet type preservation ───────────────────────────────────────────────────
-
-const TASK_STATE_MARKERS = [' ', 'x', '-', 's', '>', '<', '>-', '>skip', '>x'];
-const MIGRATION_PREFIXES = ['>', '<', '+>'];
-
-/**
- * Given a bullet marker from a line, returns the destination checkbox string
- * (e.g., "[o]", "[a]", "[ ]") preserving non-task markers, or returns the default
- * if the marker is a task state or migration marker.
- */
-export function resolveDestinationMarker(
-	bulletMarker: string | null,
-	defaultMarker: string = '[ ]',
-	overrideType: string | null = null
-): string {
-	// Explicit override takes priority
-	if (overrideType) {
-		if (overrideType === '.') return ''; // info point = plain list item
-		return `[${overrideType}]`;
-	}
-
-	if (bulletMarker) {
-		const marker = bulletMarker.trim();
-		const isTaskState = TASK_STATE_MARKERS.includes(marker);
-		const isMigrationMarker =
-			MIGRATION_PREFIXES.some(prefix => marker.startsWith(prefix));
-		if (!isTaskState && !isMigrationMarker) {
-			return `[${marker}]`;
-		}
-	}
-	return defaultMarker;
 }
 
 // ── Heading detection in review files ──────────────────────────────────────────

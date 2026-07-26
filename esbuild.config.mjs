@@ -39,13 +39,6 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
-	jsx: "automatic",
-	jsxImportSource: "preact",
-	alias: {
-		"react": "preact/compat",
-		"react-dom": "preact/compat",
-		"react/jsx-runtime": "preact/jsx-runtime",
-	},
 });
 
 if (prod) {

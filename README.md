@@ -8,10 +8,14 @@ Automate your bullet journal workflow in Obsidian with powerful task migration m
 
 This plugin implements a complete bullet journal migration system for Obsidian, allowing you to:
 - **Migrate tasks** between daily, weekly, and monthly notes using simple markers
+- **Pick destinations without memorizing markers** — type `[>` in a task for an autocomplete of dates and a calendar picker
 - **Generate reviews** automatically from incomplete tasks
 - **Schedule tasks** to specific days, weeks, or months
+- **Carry subtasks with their parent** as context when migrating
+- **Schedule recurring tasks** ("every 3 weeks until the end of the year")
 - **Track task types** (events, appointments, information points)
-- **Prioritize tasks** with descriptors (P1, P2, P3, Blocked, InProgress, Highlight)
+
+> **Reliability:** task lookups use Obsidian's metadata cache and all edits are written atomically, so migrations locate the right task and won't clobber concurrent edits (e.g. from Sync).
 
 ## Required Folder Structure
 
@@ -28,7 +32,21 @@ Journal/
 └── 007 Global Reviews/     # Generated global reviews
 ```
 
+## Quick Entry (Autocomplete)
+
+You don't have to memorize the marker codes below. In any task line, start typing the checkbox marker `[>` and an autocomplete appears:
+
+- **Tomorrow**, **Next week**, **Next month** — with their resolved dates shown
+- **Pick a date…** — opens a calendar where clicking a **day** targets the daily note, a **week number** the weekly note, and the **month title** the monthly note
+- Type a code directly (e.g. `[>w2`, `[>fri`, `[>m3w`) and the popup previews the exact resulting date
+
+Markers resolve **relative to the note they're in**: `[>w]` in a `2026-W31` weekly note means W32, not "next week from today". This keeps migrations correct when you process past notes during a review.
+
+The `[+>` (new task) and `[->` (information point) prefixes get the same autocomplete.
+
 ## Migration Markers
+
+The markers below are what the autocomplete writes for you — you can also type them by hand.
 
 ### Basic Migration Markers
 
@@ -121,50 +139,39 @@ Migrate items as plain list items (no checkboxes):
 
 ## Commands
 
-### Process Daily Note
-**Command:** `Process Daily Note`
+### Migrate Tasks
+**Command:** `Migrate Tasks`
 
-Processes the currently open daily note, migrating all tasks with migration markers to their destinations.
+Processes the current note, migrating all marked tasks to their destinations. Auto-detects the note type (daily, weekly, monthly, or a generated review) — this is the one command you run to "process" whatever note you're in.
 
-### Generate Weekly Review
-**Command:** `Generate Weekly Review`
+### Migrate Selected Tasks
+**Command:** `Migrate Selected Tasks`
 
-Creates a weekly review document with all incomplete tasks from the current week's daily notes and the weekly note.
+Same as **Migrate Tasks**, but only processes the lines you have selected. Useful in review documents where you want to migrate a few items at a time.
 
-### Process Weekly Review
-**Command:** `Process Weekly Review`
+### Schedule Tasks / Schedule Selected Tasks
+**Commands:** `Schedule Tasks`, `Schedule Selected Tasks`
 
-Processes the currently open weekly review, migrating all marked tasks.
+Like the migrate commands, but mark the source with `[s]` (scheduled) instead of `[>]` (migrated) — for planning notes where the task is being placed onto a future date rather than moved out.
 
-### Schedule Weekly Plan
-**Command:** `Schedule Weekly Plan`
+### Schedule recurring task
+**Command:** `Schedule recurring task`
 
-Processes a weekly plan note, scheduling tasks to specific days of the week.
+Lays down every occurrence of the current task from now until a date you choose, stepping by a customisable interval. See [Recurring Tasks](#recurring-tasks).
 
-### Generate Monthly Review
-**Command:** `Generate Monthly Review`
+### Generate Weekly / Monthly / Global Review
+**Commands:** `Generate Weekly Review`, `Generate Monthly Review`, `Generate Global Review`
 
-Creates a monthly review document with all incomplete tasks from the current month's daily notes, weekly notes, and the monthly note.
+Create a review document collecting all incomplete tasks for the period (the week's/month's daily notes and higher-level notes; the global review spans all periods). Add markers to the review, then run **Migrate Tasks** on it to send everything to its destination.
 
-### Process Monthly Review
-**Command:** `Process Monthly Review`
+## Recurring Tasks
 
-Processes the currently open monthly review, migrating all marked tasks.
+Run **Schedule recurring task** on a task line to open a small dialog:
 
-### Schedule Monthly Plan
-**Command:** `Schedule Monthly Plan`
+- **Every** N **days / weeks / months** — the unit picks where occurrences land, matching the markers: days → daily notes, weeks → weekly notes, months → monthly notes.
+- **Until** a date (defaults to the end of the year).
 
-Processes a monthly plan note, scheduling tasks to specific weeks or days.
-
-### Generate Global Review
-**Command:** `Generate Global Review`
-
-Creates a comprehensive global review with incomplete tasks from all periods.
-
-### Process Global Review
-**Command:** `Process Global Review`
-
-Processes the global review, migrating all marked tasks.
+Every occurrence is created as a plain `- [ ]` task in the matching note, up to a safety limit of 100. The source task is left as-is, and re-running is safe (duplicates are skipped). For example, "every 3 weeks until the end of the year" for *Call grandma* seeds `- [ ] Call grandma` into each third weekly note.
 
 ## Workflow Examples
 
@@ -177,7 +184,7 @@ Processes the global review, migrating all marked tasks.
    - [>>] Review presentation
    - [>m{o}] Plan vacation event
    ```
-3. Run "Process Daily Note" command
+3. Run "Migrate Tasks" command
 4. Tasks are automatically migrated to their destinations
 
 ### Weekly Review Workflow
@@ -190,7 +197,7 @@ Processes the global review, migrating all marked tasks.
    - [>fut] Read article
    - [<] Update documentation
    ```
-4. Run "Process Weekly Review" command
+4. Run "Migrate Tasks" command (on the review document)
 5. Tasks are migrated accordingly
 
 ### Monthly Planning Workflow
@@ -198,7 +205,7 @@ Processes the global review, migrating all marked tasks.
 1. Run "Generate Monthly Review" command
 2. Review all incomplete tasks from the month
 3. Add markers to schedule tasks for next month
-4. Run "Process Monthly Review" command
+4. Run "Migrate Tasks" command (on the review document)
 
 ## Task Migration Behavior
 
@@ -209,6 +216,7 @@ Processes the global review, migrating all marked tasks.
   - Completed children (`[x]`) stay in source
   - Cancelled children (`[-]`) stay in source
   - Children can override parent's destination with their own marker
+- **Migrating a subtask alone**: its parent is carried along as a plain-bullet **context** line (not a duplicate task) so the subtask doesn't arrive orphaned; if that parent already exists at the destination, the subtask nests under it
 - **Information points**: Created as plain list items without checkboxes
 - **Deduplication**: Tasks with identical text (normalized) are not added if they already exist in the destination
   - Prevents duplicate entries when migrating the same task multiple times
@@ -323,7 +331,7 @@ The plugin detected that "Call dentist" already exists in Friday's note, so it s
 
 1. Install the BRAT plugin from Obsidian Community Plugins
 2. Open command palette and run "BRAT: Add a beta plugin for testing"
-3. Enter: `lwshaban/obsidian-bujo-migration`
+3. Enter: `lwshaban/obsidian-bullet-journal-migration`
 4. Enable the plugin in Settings → Community Plugins
 
 ### Manual Installation
@@ -337,7 +345,7 @@ The plugin detected that "Call dentist" already exists in Friday's note, so it s
 
 ```bash
 # Clone the repository
-git clone https://github.com/lwshaban/obsidian-bujo-migration.git
+git clone https://github.com/lwshaban/obsidian-bullet-journal-migration.git
 
 # Install dependencies
 npm install

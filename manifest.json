@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-bujo-migration",
 	"name": "Bujo",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"minAppVersion": "0.15.0",
 	"description": "Automate bullet journal migration workflows for daily, weekly, and monthly notes with task migration markers and review generation.",
 	"author": "Lawrence Shaban",

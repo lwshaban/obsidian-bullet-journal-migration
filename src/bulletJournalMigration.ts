@@ -1,7 +1,7 @@
 // Bullet Journal Migration System
 // Provides weekly and monthly review generation and processing
 
-import { App, Notice, TFile, TFolder, moment, Editor } from 'obsidian';
+import { App, Notice, TFile, moment, Editor } from 'obsidian';
 import { MigrationMarker, MigrationResult, TaskType, PeriodType, ChildTask, DestinationDate } from './types';
 import {
 	normalizeText,
@@ -15,11 +15,11 @@ import {
 	getIndentLevel,
 	removeMetadata,
 	collectChildTasks,
-	fuzzyFindLine,
-	headingToSourcePath,
-	resolveDestinationMarker,
 	tryParseHeadingPath,
 } from './utils';
+import { locateTaskLine, descendantLines, ancestorLines } from './locate';
+import { resolveRelativeMarker } from './markers';
+import { computeRecurrence, RecurUnit } from './recurrence';
 
 export class BulletJournalMigration {
 	app: App;
@@ -38,7 +38,7 @@ export class BulletJournalMigration {
     parseMigrationMarker(line: string): MigrationMarker | null {
         // Check for information point marker [-> (migrates as plain list item, no [>] marker)
         // Syntax: - [->w], - [->m], - [->fri], etc. (dash before arrow, in checkbox position)
-        const infoPointMatch = line.match(/^\s*-\s*\[->(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)\]/i);
+        const infoPointMatch = line.match(/^\s*-\s*\[->(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})\]/i);
         if (infoPointMatch && infoPointMatch[1]) {
             return {
                 marker: infoPointMatch[1].toLowerCase(),
@@ -57,7 +57,7 @@ export class BulletJournalMigration {
         // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
         // Note: (...) for source is ignored for new tasks (no source to update)
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i);
+        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i);
         if (newTaskMatch && newTaskMatch[1]) {
             const destCheckboxContent = newTaskMatch[3] || null;  // {...} for destination
             return {
@@ -150,7 +150,7 @@ export class BulletJournalMigration {
         // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
         // Example: [>w(/){=}] - source becomes [/], destination becomes [=]
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut)(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i;
+        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i;
         const match = line.match(markerRegex);
 
         if (!match || !match[1]) {
@@ -216,6 +216,32 @@ export class BulletJournalMigration {
         const sourceMoment = moment(sourceDate, 'YYYY-MM-DD');
         const today = moment().startOf('day');
 
+        // Explicit destinations (from the date picker or typed directly)
+        // [>2026-07-30] → daily, [>2026-W32] → weekly, [>2026-08] → monthly
+        // Note: marker arrives lowercased, so the week form is e.g. "2026-w32"
+        if (/^\d{4}-\d{2}-\d{2}$/.test(marker)) {
+            const explicitDay = moment(marker, 'YYYY-MM-DD', true);
+            return explicitDay.isValid()
+                ? { date: marker, targetType: 'daily' }
+                : null;
+        }
+        const explicitWeekMatch = marker.match(/^(\d{4})-w(\d{2})$/);
+        if (explicitWeekMatch && explicitWeekMatch[1] && explicitWeekMatch[2]) {
+            const explicitWeek = moment()
+                .year(parseInt(explicitWeekMatch[1], 10))
+                .isoWeek(parseInt(explicitWeekMatch[2], 10))
+                .startOf('isoWeek');
+            return explicitWeek.isValid()
+                ? { date: explicitWeek.format('YYYY-MM-DD'), targetType: 'weekly' }
+                : null;
+        }
+        if (/^\d{4}-\d{2}$/.test(marker)) {
+            const explicitMonth = moment(`${marker}-01`, 'YYYY-MM-DD', true);
+            return explicitMonth.isValid()
+                ? { date: `${marker}-01`, targetType: 'monthly' }
+                : null;
+        }
+
         // Migrate to today [>:] or [>|]
         if (marker === ':' || marker === '|') {
             return {
@@ -251,141 +277,14 @@ export class BulletJournalMigration {
             };
         }
 
-        // Tomorrow [>>] - always relative to today
-        if (marker === '>') {
-            return {
-                date: today.clone().add(1, 'day').format('YYYY-MM-DD'),
-                targetType: 'daily',
-            };
-        }
-
-        // Numbered weeks from now (w1 = 1 week, w2 = 2 weeks, etc.) - relative to today
-        const weekNumberMatch = marker.match(/^w(\d+)$/);
-        if (weekNumberMatch && weekNumberMatch[1]) {
-            const weekNum = parseInt(weekNumberMatch[1], 10);
-            if (weekNum >= 1) {
-                const targetMoment = today.clone().add(weekNum, 'weeks').startOf('isoWeek');
-                return {
-                    date: targetMoment.format('YYYY-MM-DD'),
-                    targetType: 'weekly',
-                };
-            }
-        }
-
-        // Nth week of the month (m3w = 3rd week of month) - relative to today
-        const monthWeekMatch = marker.match(/^m(\d+)w$/);
-        if (monthWeekMatch && monthWeekMatch[1]) {
-            const weekNum = parseInt(monthWeekMatch[1], 10);
-            if (weekNum >= 1 && weekNum <= 4) {
-                const weekDayMap: { [key: number]: number } = { 1: 4, 2: 11, 3: 18, 4: 25 };
-                const targetDay = weekDayMap[weekNum];
-
-                if (targetDay === undefined) {
-                    return null;
-                }
-
-                // Try current month first
-                const currentMonth = today.clone().startOf('month');
-                const targetDateCurrent = currentMonth.clone().date(targetDay);
-                const mondayOfWeekCurrent = targetDateCurrent.clone().startOf('isoWeek');
-
-                // If the week has already passed, use next month
-                if (mondayOfWeekCurrent.isBefore(today, 'day')) {
-                    const nextMonth = currentMonth.clone().add(1, 'month');
-                    const targetDateNext = nextMonth.clone().date(targetDay);
-                    const mondayOfWeekNext = targetDateNext.clone().startOf('isoWeek');
-
-                    return {
-                        date: mondayOfWeekNext.format('YYYY-MM-DD'),
-                        targetType: 'weekly',
-                    };
-                }
-
-                return {
-                    date: mondayOfWeekCurrent.format('YYYY-MM-DD'),
-                    targetType: 'weekly',
-                };
-            }
-        }
-
-        // Next week [>w] - relative to today
-        if (marker === 'w') {
-            return {
-                date: today.clone().add(1, 'week').startOf('isoWeek').format('YYYY-MM-DD'),
-                targetType: 'weekly',
-            };
-        }
-
-        // Next month [>m] - relative to today
-        if (marker === 'm') {
-            return {
-                date: today.clone().add(1, 'month').startOf('month').format('YYYY-MM-DD'),
-                targetType: 'monthly',
-            };
-        }
-
-        // Specific days of week [>mon], [>tue], etc. - next occurrence from today
-        const daysOfWeek: { [key: string]: number } = {
-            'mon': 1, 'tue': 2, 'tues': 2, 'wed': 3,
-            'thu': 4, 'thurs': 4, 'fri': 5, 'sat': 6, 'sun': 7
-        };
-
-        if (daysOfWeek.hasOwnProperty(marker)) {
-            const targetDay = daysOfWeek[marker];
-            if (targetDay === undefined) {
-                return null;
-            }
-            const currentDay = today.isoWeekday();
-            let daysToAdd = targetDay - currentDay;
-            if (daysToAdd <= 0) daysToAdd += 7;
-
-            const targetMoment = today.clone().add(daysToAdd, 'days');
-            return {
-                date: targetMoment.format('YYYY-MM-DD'),
-                targetType: 'daily',
-            };
-        }
-
-        // Specific months [>jan], [>feb], etc. - next occurrence from today
-        const months: { [key: string]: number } = {
-            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
-            'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
-            'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
-        };
-
-        if (months.hasOwnProperty(marker)) {
-            const targetMonth = months[marker];
-            if (targetMonth === undefined) {
-                return null;
-            }
-            const currentMonth = today.month() + 1;
-            const currentYear = today.year();
-            let targetYear = currentYear;
-            if (targetMonth <= currentMonth) targetYear += 1;
-
-            const targetDate = moment(`${targetYear}-${String(targetMonth).padStart(2, '0')}-01`);
-            const nextMonth = today.clone().add(1, 'month').startOf('month');
-
-            // If target month is beyond next month, use future log
-            if (targetDate.isAfter(nextMonth, 'month')) {
-                const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-                                  'July', 'August', 'September', 'October', 'November', 'December'];
-                return {
-                    date: targetDate.format('YYYY-MM-DD'),
-                    targetType: 'future',
-                    monthName: monthNames[targetMonth - 1],
-                };
-            }
-
-            return {
-                date: targetDate.format('YYYY-MM-DD'),
-                targetType: 'monthly',
-            };
-        }
-
-        // Future log
-        if (marker === 'fut') {
-            return { date: null, targetType: 'future' };
+        // Forward/relative markers (>>, w, wN, m, mNw, weekdays, months, fut)
+        // are anchored on the note's own date, not today: [>w] in a 2026-W31
+        // note resolves to W32. Shared with the editor suggester's preview so
+        // the popup and "Process" never disagree.
+        const anchor = sourceMoment.isValid() ? sourceMoment.clone().startOf('day') : today.clone();
+        const relative = resolveRelativeMarker(marker, anchor);
+        if (relative) {
+            return relative;
         }
 
         throw new Error(`Unknown migration marker: ${marker}`);
@@ -625,11 +524,14 @@ export class BulletJournalMigration {
         let file = this.app.vault.getAbstractFileByPath(filePath);
 
         if (!file || !(file instanceof TFile)) {
-            // Ensure parent folder exists
+            // Ensure parent folder exists (tolerate races with sync/other plugins)
             const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
-            const folder = this.app.vault.getAbstractFileByPath(folderPath);
-            if (!folder) {
-                await this.app.vault.createFolder(folderPath);
+            if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
+                try {
+                    await this.app.vault.createFolder(folderPath);
+                } catch (error) {
+                    console.warn(`[BuJo] createFolder raced for ${folderPath} (already exists?):`, error);
+                }
             }
 
             const templatePath = this.getTemplatePath(filePath);
@@ -643,15 +545,22 @@ export class BulletJournalMigration {
                     return;
                 }
             } else {
-                console.log(`[BuJo] No template found, creating empty file: ${filePath}`);
-                await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
-                return;
+                console.log(`[BuJo] No template found, creating file: ${filePath}`);
+                try {
+                    await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
+                    return;
+                } catch (error) {
+                    // Race: something else created the file between the existence
+                    // check and create — fall through and append to it instead
+                    file = this.app.vault.getAbstractFileByPath(filePath);
+                    if (!file || !(file instanceof TFile)) throw error;
+                }
             }
         }
 
         // File exists (either already existed or was just created from template)
-        // Now append the task
-        const content = await this.app.vault.read(file);
+        // Append atomically so concurrent edits (sync, other plugins) aren't clobbered
+        await this.app.vault.process(file, (content) => {
         const lines = content.split('\n');
         let insertIndex = lines.length;
 
@@ -704,294 +613,207 @@ export class BulletJournalMigration {
             }
         }
 
-        // Deduplication: Check if task already exists in destination
-        const newTaskText = this.getTaskText(taskLine);
-        const normalizedNewText = this.normalizeText(newTaskText);
+        // A batch may lead with plain-bullet context parents (e.g. a migrated
+        // subtask carrying its parent). The "real" task to dedup on is the first
+        // line with a checkbox, not the context header. Anchor the checkbox to
+        // the dash so wikilink brackets in a header aren't mistaken for one.
+        const isTaskLine = (l: string) => /^\s*-\s*\[[^\]]+\]/.test(l);
+        const primaryIndex = taskLines.findIndex(isTaskLine);
+        const contextCount = primaryIndex > 0 ? primaryIndex : 0;
+        const primaryLine = taskLines[primaryIndex >= 0 ? primaryIndex : 0] ?? taskLine;
 
-        // Search for duplicate task in the destination file
+        // Deduplication: skip if the actual task already exists anywhere here
+        const normalizedNewText = this.normalizeText(this.getTaskText(primaryLine));
         const existingTaskIndex = lines.findIndex(line => {
             if (!this.isBulletItem(line)) return false;
-            const existingText = this.getTaskText(line);
-            const normalizedExisting = this.normalizeText(existingText);
-            return normalizedExisting === normalizedNewText;
+            return this.normalizeText(this.getTaskText(line)) === normalizedNewText;
         });
 
         if (existingTaskIndex !== -1) {
-            // Task already exists - skip duplicate
-            console.log(`[BuJo] Task already exists in ${filePath}, skipping duplicate: "${newTaskText}"`);
-            return; // Skip adding duplicate task
+            console.log(`[BuJo] Task already exists in ${filePath}, skipping duplicate: "${this.getTaskText(primaryLine)}"`);
+            return content; // Skip adding duplicate task
         }
 
-        // Not a duplicate - append task(s) to file
+        // Find-or-create the context parent: if the immediate parent already
+        // exists at the destination (e.g. a sibling subtask migrated earlier),
+        // nest the task + children under it instead of adding a second header.
+        if (contextCount > 0) {
+            const immediateParent = taskLines[contextCount - 1];
+            const parentText = immediateParent ? this.normalizeText(this.getTaskText(immediateParent)) : '';
+            const existingParentIndex = parentText
+                ? lines.findIndex(l => this.isBulletItem(l) && this.normalizeText(this.getTaskText(l)) === parentText)
+                : -1;
+
+            if (existingParentIndex !== -1) {
+                const parentLine = lines[existingParentIndex] ?? '';
+                const parentIndent = this.getIndentLevel(parentLine);
+
+                // Walk to the end of the parent's existing subtree
+                let subtreeEnd = existingParentIndex + 1;
+                while (subtreeEnd < lines.length) {
+                    const l = lines[subtreeEnd];
+                    if (l === undefined) break;
+                    if (l.trim() === '') { subtreeEnd++; continue; }
+                    if (this.getIndentLevel(l) <= parentIndent) break;
+                    subtreeEnd++;
+                }
+
+                // Rebase the task + children under the existing parent's indent
+                const body = taskLines.slice(contextCount);
+                const bodyBase = body[0]?.match(/^(\s*)/)?.[0] ?? '';
+                const targetBase = (parentLine.match(/^(\s*)/)?.[0] ?? '') + '\t';
+                const rebased = body.map(l => l.startsWith(bodyBase) ? targetBase + l.slice(bodyBase.length) : l);
+
+                lines.splice(subtreeEnd, 0, ...rebased);
+                console.log(`[BuJo] Nested ${rebased.length} line(s) under existing parent "${this.getTaskText(parentLine)}" in ${filePath}`);
+                return lines.join('\n');
+            }
+        }
+
+        // Not a duplicate and no existing parent - append the whole batch
         lines.splice(insertIndex, 0, ...taskLines);
-        await this.app.vault.modify(file, lines.join('\n'));
         console.log(`[BuJo] Appended ${taskLines.length} line(s) to ${filePath}: ${taskLine}`);
+        return lines.join('\n');
+        });
     }
 
     /**
-     * Update task in file
+     * Schedule a task to recur: create a plain [ ] occurrence in every note
+     * from now until `untilISO`, stepping by the interval. The unit sets the
+     * note granularity (days→daily, weeks→weekly, months→monthly). The source
+     * task is left untouched, and re-running is safe because appendToFile
+     * dedups by task text.
+     */
+    async scheduleRecurring(
+        taskText: string,
+        everyN: number,
+        unit: RecurUnit,
+        untilISO: string,
+    ): Promise<{ created: number; capped: boolean; targetType: string }> {
+        const clean = this.removeMetadata(taskText).trim();
+        if (!clean) return { created: 0, capped: false, targetType: '' };
+
+        const { dates, targetType, capped } = computeRecurrence(everyN, unit, untilISO);
+        for (const date of dates) {
+            const path = this.getTargetFilePath(date, targetType);
+            await this.appendToFile(path, `- [ ] ${clean}`);
+        }
+        return { created: dates.length, capped, targetType };
+    }
+
+    /**
+     * Update task in file. Atomic via vault.process; located through the
+     * metadata cache (exact match, then normalized text). No fuzzy matching —
+     * throws if the task cannot be found so callers fail loudly.
      */
     async updateTaskInFile(filePath: string, oldLine: string, newLine: string): Promise<void> {
         const file = this.app.vault.getAbstractFileByPath(filePath);
         if (!file || !(file instanceof TFile)) throw new Error(`File not found: ${filePath}`);
 
-        const content = await this.app.vault.read(file);
-        const lines = content.split('\n');
+        const cache = this.app.metadataCache.getFileCache(file);
+        const newLineTrimmed = newLine.trim();
+        const isTask = (l: string) => /^\s*-\s*\[[^\]]+\]/.test(l);
         let found = false;
 
-        // Extract the indentation from newLine to preserve it
-        const newLineIndentMatch = newLine.match(/^(\s*)/);
-        const newLineIndent = newLineIndentMatch ? newLineIndentMatch[0] : '';
-        const newLineTrimmed = newLine.trim();
+        await this.app.vault.process(file, (content) => {
+            const lines = content.split('\n');
+            const idx = locateTaskLine(lines, oldLine, cache, isTask);
+            if (idx === -1) return content;
+            const line = lines[idx];
+            if (line === undefined) return content;
+            found = true;
 
-        const updatedLines = lines.map(line => {
-            if (!found && line.trim() === oldLine.trim()) {
-                found = true;
-                // Preserve the original line's indentation
-                const indentMatch = line.match(/^(\s*)/);
-                const indent = indentMatch ? indentMatch[0] : '';
-                return indent + newLineTrimmed;
+            // Re-run safety: if the located line already carries the target
+            // checkbox, leave it untouched
+            const targetMarker = newLineTrimmed.match(/^-\s*\[([^\]]+)\]/);
+            const currentMarker = line.match(/^\s*-\s*\[([^\]]+)\]/);
+            if (targetMarker && currentMarker && targetMarker[1] === currentMarker[1]) {
+                console.log(`[BuJo] Task already in target state [${targetMarker[1]}], skipping update`);
+                return content;
             }
-            return line;
+
+            // Preserve the original line's indentation
+            const indentMatch = line.match(/^(\s*)/);
+            const indent = indentMatch ? indentMatch[0] : '';
+            lines[idx] = indent + newLineTrimmed;
+            return lines.join('\n');
         });
 
         if (!found) {
-            const oldTaskText = this.getTaskText(oldLine);
-            const oldTaskTextClean = this.removeMetadata(oldTaskText).trim();  // Remove (from: ...) metadata and trim
-            console.log(`[BuJo] Looking for task with text: "${oldTaskTextClean}" in ${filePath}`);
-            
-            const normalizedOldText = this.normalizeText(oldTaskTextClean);
-            
-            const updatedLinesLenient = lines.map(line => {
-                // Match any task (incomplete, completed, deleted, or with migration markers)
-                const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-
-                if (!found && isTask) {
-                    const lineTaskText = this.getTaskText(line);
-                    const lineTaskTextClean = this.removeMetadata(lineTaskText).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskTextClean);
-                    
-                    // Compare task text (normalized, case-insensitive)
-                    if (normalizedLineText === normalizedOldText) {
-                        console.log(`[BuJo] Found matching task: "${lineTaskTextClean}" (original: "${oldTaskTextClean}")`);
-                        found = true;
-                        // Preserve the original line's indentation
-                        const indentMatch = line.match(/^(\s*)/);
-                    const indent = indentMatch ? indentMatch[0] : '';
-                        return indent + newLineTrimmed;
-                    }
-                }
-                return line;
-            });
-
-            if (found) {
-                await this.app.vault.modify(file, updatedLinesLenient.join('\n'));
-                return;
-            }
-            
-            // Try fuzzy matching - check if any task contains most of the words
-            if (!found) {
-                const oldWords = normalizedOldText.split(/\s+/).filter((w: string) => w.length > 2); // Words longer than 2 chars
-                let bestMatch: { line: string; lineTaskTextClean: string; normalizedLineText: string } | null = null;
-                let bestScore = 0;
-
-                lines.forEach(line => {
-                    if (/^\s*-\s*\[[^\]]+\]/.test(line)) {
-                        const lineTaskText = this.getTaskText(line);
-                        const lineTaskTextClean = this.removeMetadata(lineTaskText).trim();
-                        const normalizedLineText = this.normalizeText(lineTaskTextClean);
-                        const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-                        
-                        // Count matching words
-                        const matchingWords = oldWords.filter(w => lineWords.includes(w)).length;
-                        const score = matchingWords / Math.max(oldWords.length, lineWords.length);
-                        
-                        if (score > bestScore && score > 0.7) { // At least 70% word match
-                            bestScore = score;
-                            bestMatch = { line, lineTaskTextClean, normalizedLineText };
-                        }
-                    }
-                });
-
-                if (bestMatch !== null) {
-                    const { line: matchedLine, lineTaskTextClean: matchedTaskTextClean } = bestMatch;
-                    if (!matchedLine || !matchedTaskTextClean) {
-                        console.error('[BuJo] Best match missing required properties');
-                    } else {
-                        const line = matchedLine as string;
-                        const taskTextClean = matchedTaskTextClean as string;
-                        console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%): "${taskTextClean}" for "${oldTaskTextClean}"`);
-
-                    // Check if task is already in the target state
-                    const targetMarker = newLineTrimmed.match(/\[([^\]]+)\]/);
-                    const currentMarker = line.match(/\[([^\]]+)\]/);
-                    if (targetMarker && currentMarker && targetMarker[1] && currentMarker[1] && targetMarker[1] === currentMarker[1]) {
-                        console.log(`[BuJo] Task already in target state [${targetMarker[1]}], skipping update`);
-                        return; // Task already in desired state
-                    }
-
-                    const indentMatch = line.match(/^(\s*)/);
-                    const indent = indentMatch ? indentMatch[0] : '';
-                    const updatedLines = lines.map(l => l === line ? indent + newLineTrimmed : l);
-                    await this.app.vault.modify(file, updatedLines.join('\n'));
-                    return;
-                    }
-                }
-            }
-            
-            // Check if task might already be completed or migrated
-            const targetMarker = newLineTrimmed.match(/\[([^\]]+)\]/);
-            if (targetMarker) {
-                const marker = targetMarker[1];
-                const alreadyInState = lines.some(line => {
-                    if (!/^\s*-\s*\[/.test(line)) return false;
-                    const lineText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(this.removeMetadata(lineText));
-                    return normalizedLineText === normalizedOldText && line.includes(`[${marker}]`);
-                });
-                
-                if (alreadyInState) {
-                    console.log(`[BuJo] Task already in target state [${marker}], skipping update`);
-                    return; // Task already in desired state
-                }
-            }
-            
+            const oldTaskTextClean = this.removeMetadata(this.getTaskText(oldLine)).trim();
             console.error(`[BuJo] Task not found in file: ${filePath}`);
             console.error(`[BuJo] Looking for: "${oldTaskTextClean}"`);
             console.error(`[BuJo] Original line: "${oldLine.substring(0, 100)}"`);
-            console.error(`[BuJo] Available tasks in file:`, lines.filter(l => /^\s*-\s*\[/.test(l)).slice(0, 10).map(l => `  "${this.getTaskText(l)}"`).join('\n'));
             throw new Error(`Task not found: "${oldTaskTextClean.substring(0, 50)}..." in ${filePath}`);
         }
+    }
 
-        await this.app.vault.modify(file, updatedLines.join('\n'));
+    /**
+     * Shared atomic checkbox replacement: locates the task via the metadata
+     * cache (exact, then normalized text — no fuzzy matching) and rewrites its
+     * checkbox inside a single vault.process pass.
+     */
+    private async replaceCheckbox(
+        taskLine: string,
+        sourceFilePath: string,
+        pattern: RegExp,
+        replacement: string,
+        verb: string,
+        filterFn: (line: string) => boolean,
+    ): Promise<MigrationResult> {
+        try {
+            const cleanTaskLine = this.removeMetadata(taskLine);
+
+            const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
+            if (!sourceFile || !(sourceFile instanceof TFile)) {
+                return { success: false, error: `Source file not found: ${sourceFilePath}` };
+            }
+
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+            let found = false;
+
+            await this.app.vault.process(sourceFile, (content) => {
+                const lines = content.split('\n');
+                const idx = locateTaskLine(lines, cleanTaskLine, cache, filterFn);
+                if (idx === -1) return content;
+                const line = lines[idx];
+                if (line === undefined) return content;
+                lines[idx] = line.replace(pattern, replacement);
+                found = true;
+                return lines.join('\n');
+            });
+
+            if (!found) {
+                console.error(`[BuJo] Task not found to ${verb}: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
+                return { success: false, error: 'Task not found' };
+            }
+            return { success: true };
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            return { success: false, error: errorMessage };
+        }
     }
 
     /**
      * Mark task as completed in source file
      */
     async completeTask(taskLine: string, sourceFilePath: string): Promise<MigrationResult> {
-        try {
-            const cleanTaskLine = this.removeMetadata(taskLine);
-            const taskText = this.getTaskText(cleanTaskLine);
-
-            const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
-            if (!sourceFile || !(sourceFile instanceof TFile)) {
-                return { success: false, error: `Source file not found: ${sourceFilePath}` };
-            }
-
-            const content = await this.app.vault.read(sourceFile);
-            const lines = content.split('\n');
-            let found = false;
-
-            const taskTextClean = taskText.trim();
-            console.log(`[BuJo] Looking for task to complete: "${taskTextClean}" in ${sourceFilePath}`);
-
-const normalizedTaskText = this.normalizeText(taskTextClean);
-
-            const updatedLines = lines.map(line => {
-                if (!found && this.isIncompleteTask(line)) {
-                    const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskText);
-                    
-                    // Compare task text (normalized, case-insensitive)
-                    if (normalizedLineText === normalizedTaskText) {
-                        console.log(`[BuJo] Found matching task to complete: "${lineTaskText}"`);
-                        found = true;
-                        // Preserve indentation when replacing
-                        return line.replace(/^(\s*-\s*)\[\s\]/, '$1[x]');
-                    }
-                }
-                return line;
-            });
-
-            // Try fuzzy matching if exact match not found
-            if (!found) {
-                const fuzzyResult = fuzzyFindLine(lines, normalizedTaskText, (l) => this.isIncompleteTask(l));
-                if (fuzzyResult) {
-                    const bestMatch = fuzzyResult.line;
-                    const bestScore = fuzzyResult.score;
-                    console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to complete: "${this.getTaskText(bestMatch)}"`);
-                    const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[\s\]/, '$1[x]') : l);
-                    await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
-                    return { success: true };
-                }
-            }
-
-            if (found) {
-                await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-                return { success: true };
-            }
-            
-            console.error(`[BuJo] Task not found for completion: "${taskTextClean}" in ${sourceFilePath}`);
-            return { success: false, error: 'Task not found' };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMessage };
-        }
+        return this.replaceCheckbox(
+            taskLine, sourceFilePath,
+            /^(\s*-\s*)\[\s\]/, '$1[x]', 'complete',
+            (l) => this.isIncompleteTask(l),
+        );
     }
 
     /**
      * Mark task as cancelled in source file (marks with [-])
      */
     async cancelTask(taskLine: string, sourceFilePath: string): Promise<MigrationResult> {
-        try {
-            const cleanTaskLine = this.removeMetadata(taskLine);
-            const taskText = this.getTaskText(cleanTaskLine);
-
-            const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
-            if (!sourceFile || !(sourceFile instanceof TFile)) {
-                return { success: false, error: `Source file not found: ${sourceFilePath}` };
-            }
-
-            const content = await this.app.vault.read(sourceFile);
-            const lines = content.split('\n');
-            let found = false;
-
-            const taskTextClean = taskText.trim();
-            console.log(`[BuJo] Looking for task to cancel: "${taskTextClean}" in ${sourceFilePath}`);
-
-const normalizedTaskText = this.normalizeText(taskTextClean);
-
-            const updatedLines = lines.map(line => {
-                if (!found && this.isIncompleteTask(line)) {
-                    const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskText);
-                    
-                    // Compare task text (normalized, case-insensitive)
-                    if (normalizedLineText === normalizedTaskText) {
-                        console.log(`[BuJo] Found matching task to cancel: "${lineTaskText}"`);
-                        found = true;
-                        // Preserve indentation when replacing
-                        return line.replace(/^(\s*-\s*)\[\s\]/, '$1[-]');
-                    }
-                }
-                return line;
-            });
-
-            // Try fuzzy matching if exact match not found
-            if (!found) {
-                const fuzzyResult = fuzzyFindLine(lines, normalizedTaskText, (l) => this.isIncompleteTask(l));
-                if (fuzzyResult) {
-                    const bestMatch = fuzzyResult.line;
-                    const bestScore = fuzzyResult.score;
-                    console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to cancel: "${this.getTaskText(bestMatch)}"`);
-                    const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[\s\]/, '$1[-]') : l);
-                    await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
-                    return { success: true };
-                }
-            }
-
-            if (found) {
-                await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-                return { success: true };
-            }
-            
-            console.error(`[BuJo] Task not found to cancel: "${taskTextClean}" in ${sourceFilePath}`);
-            return { success: false, error: 'Task not found' };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMessage };
-        }
+        return this.replaceCheckbox(
+            taskLine, sourceFilePath,
+            /^(\s*-\s*)\[\s\]/, '$1[-]', 'cancel',
+            (l) => this.isIncompleteTask(l),
+        );
     }
 
     /**
@@ -1000,72 +822,47 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
     async deleteTask(taskLine: string, sourceFilePath: string): Promise<MigrationResult> {
         try {
             const cleanTaskLine = this.removeMetadata(taskLine);
-            const taskText = this.getTaskText(cleanTaskLine);
 
             const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
             if (!sourceFile || !(sourceFile instanceof TFile)) {
                 return { success: false, error: `Source file not found: ${sourceFilePath}` };
             }
 
-            const content = await this.app.vault.read(sourceFile);
-            const lines = content.split('\n');
-            let parentIndex = -1;
-            let parentIndent = 0;
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+            let removedCount = 0;
 
-            const taskTextClean = taskText.trim();
-            console.log(`[BuJo] Looking for task to remove: "${taskTextClean}" in ${sourceFilePath}`);
+            await this.app.vault.process(sourceFile, (content) => {
+                const lines = content.split('\n');
+                const isTask = (l: string) => /^\s*-\s*\[[^\]]+\]/.test(l);
+                const parentIndex = locateTaskLine(lines, cleanTaskLine, cache, isTask);
+                if (parentIndex === -1) return content;
+                const parentLine = lines[parentIndex];
+                if (parentLine === undefined) return content;
+                const parentIndent = this.getIndentLevel(parentLine);
 
-const normalizedTaskText = this.normalizeText(taskTextClean);
-
-            // Find the parent task
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line) continue;
-                const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-                if (isTask) {
-                    const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskText);
-                    
-                    if (normalizedLineText === normalizedTaskText) {
-                        console.log(`[BuJo] Found matching task to remove: "${lineTaskText}"`);
-                        parentIndex = i;
-                        const indentMatch = line.match(/^(\s*)/);
-                        parentIndent = indentMatch && indentMatch[1] ? indentMatch[1].length : 0;
+                // Parent plus every more-indented line following it (children and
+                // continuation lines); blank lines don't end the block
+                const toRemove = new Set<number>([parentIndex]);
+                for (let i = parentIndex + 1; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (!line || line.trim() === '') continue;
+                    if (this.getIndentLevel(line) > parentIndent) {
+                        toRemove.add(i);
+                    } else {
                         break;
                     }
                 }
-            }
 
-            if (parentIndex === -1) {
-                console.error(`[BuJo] Task not found to remove: "${taskTextClean}" in ${sourceFilePath}`);
+                removedCount = toRemove.size;
+                return lines.filter((_, index) => !toRemove.has(index)).join('\n');
+            });
+
+            if (removedCount === 0) {
+                console.error(`[BuJo] Task not found to remove: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
                 return { success: false, error: 'Task not found' };
             }
 
-            // Find all children (lines with greater indentation immediately following parent)
-            const linesToRemove = [parentIndex];
-            for (let i = parentIndex + 1; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line || line.trim() === '') {
-                    // Skip empty lines but don't stop
-                    continue;
-                }
-                const indentMatch = line.match(/^(\s*)/);
-                const currentIndent = indentMatch && indentMatch[1] ? indentMatch[1].length : 0;
-                
-                if (currentIndent > parentIndent) {
-                    // This is a child, mark for removal
-                    linesToRemove.push(i);
-                } else {
-                    // No longer a child, stop
-                    break;
-                }
-            }
-
-            // Remove lines (filter out marked lines)
-            const updatedLines = lines.filter((_, index) => !linesToRemove.includes(index));
-            
-            await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-            console.log(`[BuJo] Removed task and ${linesToRemove.length - 1} children from ${sourceFilePath}`);
+            console.log(`[BuJo] Removed task and ${removedCount - 1} children from ${sourceFilePath}`);
             return { success: true };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1078,180 +875,23 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
      * Mark task as scheduled in source file (uses [s] marker)
      */
     async markAsScheduled(taskLine: string, sourceFilePath: string): Promise<MigrationResult> {
-        try {
-            const cleanTaskLine = this.removeMetadata(taskLine);
-            const taskText = this.getTaskText(cleanTaskLine);
-
-            const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
-            if (!sourceFile || !(sourceFile instanceof TFile)) {
-                return { success: false, error: `Source file not found: ${sourceFilePath}` };
-            }
-
-            const content = await this.app.vault.read(sourceFile);
-            const lines = content.split('\n');
-            let found = false;
-
-            const taskTextClean = taskText.trim();
-            console.log(`[BuJo] Looking for task to mark as scheduled: "${taskTextClean}" in ${sourceFilePath}`);
-
-const normalizedTaskText = this.normalizeText(taskTextClean);
-
-            const updatedLines = lines.map(line => {
-                // Match any task (incomplete, completed, deleted, or with migration markers)
-                const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-                if (!found && isTask) {
-                    // Skip tasks that already have [>-] or [<] markers
-                    if (line.includes('[>-]') || line.includes('[<]')) {
-                        return line;
-                    }
-                    
-                    const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskText);
-                    
-                    // Compare task text (normalized, case-insensitive)
-                    if (normalizedLineText === normalizedTaskText) {
-                        console.log(`[BuJo] Found matching task to mark as scheduled: "${lineTaskText}"`);
-                        found = true;
-                        // Preserve indentation when replacing - replace any migration marker with [s]
-                        return line.replace(/^(\s*-\s*)\[([^\]]+)\]/, '$1[s]');
-                    }
-                }
-                return line;
-            });
-
-            // Try fuzzy matching if exact match not found
-            if (!found) {
-                const taskWords = normalizedTaskText.split(/\s+/).filter((w: string) => w.length > 2);
-                let bestMatch: string | null = null;
-                let bestScore = 0;
-                
-                lines.forEach(line => {
-                    // Match any task (incomplete, completed, deleted, or with migration markers)
-                    const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-                    if (isTask) {
-                        // Skip tasks that already have [>-] or [<] markers
-                        if (line.includes('[>-]') || line.includes('[<]')) {
-                            return;
-                        }
-                        
-                        const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = this.normalizeText(lineTaskText);
-                        const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-                        
-                        const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
-                        const score = matchingWords / Math.max(taskWords.length, lineWords.length);
-                        
-                        if (score > bestScore && score > 0.7) {
-                            bestScore = score;
-                            bestMatch = line;
-                        }
-                    }
-                });
-                
-                if (bestMatch) {
-                    console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to mark as scheduled: "${this.getTaskText(bestMatch)}"`);
-                    const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[([^\]]+)\]/, '$1[s]') : l);
-                    await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
-                    return { success: true };
-                }
-            }
-
-            if (found) {
-                await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-                return { success: true };
-            }
-            
-            console.error(`[BuJo] Task not found to mark as scheduled: "${taskTextClean}" in ${sourceFilePath}`);
-            return { success: false, error: 'Task not found' };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMessage };
-        }
+        return this.replaceCheckbox(
+            taskLine, sourceFilePath,
+            /^(\s*-\s*)\[([^\]]+)\]/, '$1[s]', 'mark as scheduled',
+            // Any task, except ones already marked [>-] or [<]
+            (l) => /^\s*-\s*\[[^\]]+\]/.test(l) && !l.includes('[>-]') && !l.includes('[<]'),
+        );
     }
 
     /**
      * Mark task as migrated in source file without creating destination task
      */
     async markAsMigrated(taskLine: string, sourceFilePath: string): Promise<MigrationResult> {
-        try {
-            const cleanTaskLine = this.removeMetadata(taskLine);
-            const taskText = this.getTaskText(cleanTaskLine);
-
-            const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
-            if (!sourceFile || !(sourceFile instanceof TFile)) {
-                return { success: false, error: `Source file not found: ${sourceFilePath}` };
-            }
-
-            const content = await this.app.vault.read(sourceFile);
-            const lines = content.split('\n');
-            let found = false;
-
-            const taskTextClean = taskText.trim();
-            console.log(`[BuJo] Looking for task to mark as migrated: "${taskTextClean}" in ${sourceFilePath}`);
-
-const normalizedTaskText = this.normalizeText(taskTextClean);
-
-            const updatedLines = lines.map(line => {
-                // Match any task (incomplete, completed, deleted, or with migration markers)
-                const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-                if (!found && isTask) {
-                    const lineTaskText = this.getTaskText(line).trim();
-                    const normalizedLineText = this.normalizeText(lineTaskText);
-                    
-                    // Compare task text (normalized, case-insensitive)
-                    if (normalizedLineText === normalizedTaskText) {
-                        console.log(`[BuJo] Found matching task to mark as migrated: "${lineTaskText}"`);
-                        found = true;
-                        // Preserve indentation when replacing - replace any marker with [>]
-                        return line.replace(/^(\s*-\s*)\[([^\]]+)\]/, '$1[>]');
-                    }
-                }
-                return line;
-            });
-
-            // Try fuzzy matching if exact match not found
-            if (!found) {
-                const taskWords = normalizedTaskText.split(/\s+/).filter((w: string) => w.length > 2);
-                let bestMatch: string | null = null;
-                let bestScore = 0;
-                
-                lines.forEach(line => {
-                    // Match any task (incomplete, completed, deleted, or with migration markers)
-                    const isTask = /^\s*-\s*\[[^\]]+\]/.test(line);
-                    if (isTask) {
-                        const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = this.normalizeText(lineTaskText);
-                        const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-                        
-                        const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
-                        const score = matchingWords / Math.max(taskWords.length, lineWords.length);
-                        
-                        if (score > bestScore && score > 0.7) {
-                            bestScore = score;
-                            bestMatch = line;
-                        }
-                    }
-                });
-                
-                if (bestMatch) {
-                    console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to mark as migrated: "${this.getTaskText(bestMatch)}"`);
-                    const updatedLinesFuzzy = lines.map(l => l === bestMatch ? l.replace(/^(\s*-\s*)\[([^\]]+)\]/, '$1[>]') : l);
-                    await this.app.vault.modify(sourceFile, updatedLinesFuzzy.join('\n'));
-                    return { success: true };
-                }
-            }
-
-            if (found) {
-                await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-                return { success: true };
-            }
-            
-            console.error(`[BuJo] Task not found to mark as migrated: "${taskTextClean}" in ${sourceFilePath}`);
-            return { success: false, error: 'Task not found' };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMessage };
-        }
+        return this.replaceCheckbox(
+            taskLine, sourceFilePath,
+            /^(\s*-\s*)\[([^\]]+)\]/, '$1[>]', 'mark as migrated',
+            (l) => /^\s*-\s*\[[^\]]+\]/.test(l),
+        );
     }
 
     /**
@@ -1346,67 +986,38 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
             
             const content = await this.app.vault.read(sourceFile);
             const lines = content.split('\n');
-            
-            // Find the parent task in the source file
-            let parentIndex = -1;
-            let parentIndent = 0;
-            const normalizedParentText = this.normalizeText(parentTaskText);
-            
-            // First, try exact match
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line) continue;
-                if (this.isBulletItem(line)) {
-                    const lineText = this.getTaskText(line);
-                    const normalizedLineText = this.normalizeText(lineText);
-                    
-                    // Exact match
-                    if (normalizedLineText === normalizedParentText) {
-                        parentIndex = i;
-                        parentIndent = this.getIndentLevel(line);
-                        console.log(`[BuJo] Found exact parent match at line ${i + 1}: "${lineText}"`);
-                        break;
-                    }
-                }
-            }
-            
-            // If no exact match, try fuzzy match (check if parent text is contained in line or vice versa)
-            if (parentIndex === -1) {
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i];
-                    if (!line) continue;
-                    if (this.isBulletItem(line)) {
-                        const lineText = this.getTaskText(line);
-                        const normalizedLineText = this.normalizeText(lineText);
-                        
-                        // Check if one contains the other (for cases where metadata differs)
-                        if (normalizedLineText.includes(normalizedParentText) ||
-                            normalizedParentText.includes(normalizedLineText)) {
-                            // Make sure it's a reasonable match (at least 50% overlap)
-                            const shorter = normalizedLineText.length < normalizedParentText.length 
-                                ? normalizedLineText 
-                                : normalizedParentText;
-                            const longer = normalizedLineText.length >= normalizedParentText.length 
-                                ? normalizedLineText 
-                                : normalizedParentText;
-                            
-                            if (longer.includes(shorter) && shorter.length >= longer.length * 0.5) {
-                                parentIndex = i;
-                                parentIndent = this.getIndentLevel(line);
-                                console.log(`[BuJo] Found fuzzy parent match at line ${i + 1}: "${lineText}"`);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            
+            const cache = this.app.metadataCache.getFileCache(sourceFile);
+
+            // Locate the parent (exact, then normalized text — no fuzzy matching)
+            const parentIndex = locateTaskLine(lines, `- ${parentTaskText}`, cache, (l) => this.isBulletItem(l));
             if (parentIndex === -1) {
                 console.log(`[BuJo] Parent task not found in source file: ${sourceFilePath}, looking for: "${parentTaskText}"`);
                 return [];
             }
-            
-            // Collect children from source file
+            const parentLine = lines[parentIndex];
+            if (parentLine === undefined) return [];
+            const parentIndent = this.getIndentLevel(parentLine);
+
+            // Prefer the cache's parent pointers for the hierarchy; each hit is
+            // validated against current content, with an indent-walk fallback
+            // for when the cache is missing or stale
+            const cachedDescendants = descendantLines(cache, parentIndex);
+            if (cachedDescendants) {
+                const children: { line: string; index: number; indent: number }[] = [];
+                for (const n of cachedDescendants) {
+                    if (n <= parentIndex) continue;
+                    const line = lines[n];
+                    if (line === undefined || !this.isBulletItem(line)) continue;
+                    const indent = this.getIndentLevel(line);
+                    if (indent <= parentIndent) continue;
+                    children.push({ line, index: n, indent });
+                }
+                if (children.length > 0) {
+                    console.log(`[BuJo] Found ${children.length} child task(s) via metadata cache for parent at line ${parentIndex + 1}`);
+                    return children;
+                }
+            }
+
             const childTasks = this.collectChildTasks(lines, parentIndex, parentIndent);
             console.log(`[BuJo] Found ${childTasks.length} child task(s) for parent in source file at line ${parentIndex + 1}`);
             return childTasks;
@@ -1418,6 +1029,54 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
     }
 
     normalizeText = normalizeText;
+
+    /**
+     * Collect the parent chain of a task as plain context text (outermost
+     * first), so a migrated subtask can carry its parents to the destination
+     * as non-task context bullets. Uses the metadata cache's parent pointers,
+     * with an indent-walk fallback. Returns [] for top-level tasks.
+     */
+    async collectAncestorContext(sourceFilePath: string, taskLine: string): Promise<string[]> {
+        if (!sourceFilePath) return [];
+        try {
+            const file = this.app.vault.getAbstractFileByPath(sourceFilePath);
+            if (!file || !(file instanceof TFile)) return [];
+
+            const content = await this.app.vault.read(file);
+            const lines = content.split('\n');
+            const cache = this.app.metadataCache.getFileCache(file);
+
+            const idx = locateTaskLine(lines, taskLine, cache, (l) => this.isBulletItem(l));
+            if (idx === -1) return [];
+
+            // Prefer cache parent pointers; fall back to an indent walk upward
+            let ancestorIdx = ancestorLines(cache, idx);
+            if (ancestorIdx === null) {
+                ancestorIdx = [];
+                const taskIndent = this.getIndentLevel(lines[idx] ?? '');
+                let needIndent = taskIndent;
+                for (let i = idx - 1; i >= 0 && needIndent > 0; i--) {
+                    const line = lines[i];
+                    if (!line || !line.trim() || !this.isBulletItem(line)) continue;
+                    const lineIndent = this.getIndentLevel(line);
+                    if (lineIndent < needIndent) {
+                        ancestorIdx.unshift(i);
+                        needIndent = lineIndent;
+                    }
+                }
+            }
+
+            return ancestorIdx
+                .map(n => lines[n])
+                .filter((l): l is string => l !== undefined && this.isBulletItem(l))
+                .map(l => this.removeMetadata(this.getTaskText(l)).trim())
+                .filter(text => text.length > 0);
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.error(`[BuJo] Error collecting ancestor context: ${errorMessage}`);
+            return [];
+        }
+    }
 
     /**
      * Migrate a single task (and optionally its children)
@@ -1509,111 +1168,41 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
                     return { success: false, error: `Source file not found: ${sourceFilePath}` };
                 }
 
-                const content = await this.app.vault.read(sourceFile);
-                const lines = content.split('\n');
-                let foundParent = false;
-                let parentIndex = -1;
-                let parentIndent = 0;
-
+                const cache = this.app.metadataCache.getFileCache(sourceFile);
                 // Determine the marker to use: [<] for scheduled, [>-] for migrated
                 const targetMarker = marker === 'scheduled' ? '[<]' : '[>-]';
+                let foundParent = false;
+                let childrenMarkedCount = 0;
 
-                const taskTextClean = taskText.trim();
-                console.log(`[BuJo] Looking for task to mark as ${marker}: "${taskTextClean}" in ${sourceFilePath}`);
+                console.log(`[BuJo] Looking for task to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
 
-const normalizedTaskText = this.normalizeText(taskTextClean);
+                // Mark parent and its incomplete children in one atomic pass
+                await this.app.vault.process(sourceFile, (content) => {
+                    const lines = content.split('\n');
+                    const parentIndex = locateTaskLine(lines, cleanTaskLine, cache, (l) => this.isIncompleteTask(l));
+                    if (parentIndex === -1) return content;
+                    const parentLine = lines[parentIndex];
+                    if (parentLine === undefined) return content;
+                    foundParent = true;
 
-                // Find parent task and track its position and indentation
-                const updatedLines = lines.map((line, index) => {
-                    if (!foundParent && this.isIncompleteTask(line)) {
-                        const lineTaskText = this.getTaskText(line).trim();
-                        const normalizedLineText = this.normalizeText(lineTaskText);
+                    const parentIndent = this.getIndentLevel(parentLine);
+                    lines[parentIndex] = parentLine.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
 
-                        // Compare task text (normalized, case-insensitive)
-                        if (normalizedLineText === normalizedTaskText) {
-                            console.log(`[BuJo] Found matching task to mark as ${marker}: "${lineTaskText}"`);
-                            foundParent = true;
-                            parentIndex = index;
-                            parentIndent = this.getIndentLevel(line);
-                            // Preserve indentation when replacing
-                            return line.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
+                    for (const child of this.collectChildTasks(lines, parentIndex, parentIndent)) {
+                        if (this.isIncompleteTask(child.line)) {
+                            lines[child.index] = child.line.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
+                            childrenMarkedCount++;
                         }
                     }
-                    return line;
+                    return lines.join('\n');
                 });
 
-                // Try fuzzy matching if exact match not found
                 if (!foundParent) {
-                    const taskWords = normalizedTaskText.split(/\s+/).filter((w: string) => w.length > 2);
-                    let bestMatch: string | null = null;
-                    let bestMatchIndex = -1;
-                    let bestScore = 0;
-
-                    lines.forEach((line, index) => {
-                        if (this.isIncompleteTask(line)) {
-                            const lineTaskText = this.getTaskText(line).trim();
-                            const normalizedLineText = this.normalizeText(lineTaskText);
-                            const lineWords = normalizedLineText.split(/\s+/).filter((w: string) => w.length > 2);
-
-                            const matchingWords = taskWords.filter(w => lineWords.includes(w)).length;
-                            const score = matchingWords / Math.max(taskWords.length, lineWords.length);
-
-                            if (score > bestScore && score > 0.7) {
-                                bestScore = score;
-                                bestMatch = line;
-                                bestMatchIndex = index;
-                            }
-                        }
-                    });
-
-                    if (bestMatch && typeof bestMatch === 'string') {
-                        const matchedLine = bestMatch as string;
-                        console.log(`[BuJo] Found fuzzy match (${Math.round(bestScore * 100)}%) to mark as ${marker}: "${this.getTaskText(matchedLine)}"`);
-                        foundParent = true;
-                        parentIndex = bestMatchIndex;
-                        parentIndent = this.getIndentLevel(matchedLine);
-                        updatedLines[bestMatchIndex] = matchedLine.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
-                    }
-                }
-
-                if (!foundParent) {
-                    console.error(`[BuJo] Task not found to mark as ${marker}: "${taskTextClean}" in ${sourceFilePath}`);
+                    console.error(`[BuJo] Task not found to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
                     return { success: false, error: 'Task not found' };
                 }
 
-                // Mark child tasks with the same marker (maintain parent-child relationship)
-                let childrenMarkedCount = 0;
-                for (let i = parentIndex + 1; i < updatedLines.length; i++) {
-                    const line = updatedLines[i];
-                    if (!line) continue;
-                    const lineIndent = this.getIndentLevel(line);
-
-                    // If line has same or less indentation, we've reached the end of children
-                    if (lineIndent <= parentIndent) {
-                        break;
-                    }
-
-                    // Skip empty lines or non-bullet items
-                    if (!line.trim() || !this.isBulletItem(line)) {
-                        continue;
-                    }
-
-                    // Mark child task if it's an incomplete task
-                    if (this.isIncompleteTask(line)) {
-                        updatedLines[i] = line.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
-                        childrenMarkedCount++;
-                        console.log(`[BuJo] Marked child task as ${marker}: "${this.getTaskText(line).trim()}"`);
-                    }
-                }
-
-                await this.app.vault.modify(sourceFile, updatedLines.join('\n'));
-
-                if (childrenMarkedCount > 0) {
-                    console.log(`[BuJo] Successfully marked parent and ${childrenMarkedCount} child task(s) as ${marker}`);
-                } else {
-                    console.log(`[BuJo] Successfully marked parent task as ${marker} (no children found)`);
-                }
-
+                console.log(`[BuJo] Marked parent and ${childrenMarkedCount} child task(s) as ${marker}`);
                 return { success: true, sourceFile: sourceFilePath, destFile: null, skipped: true, childrenMarked: childrenMarkedCount };
             }
 
@@ -1654,14 +1243,24 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
                 destMarker = this.getDestinationMarker(type as TaskType);
             }
             
-            // Preserve indentation from original line
+            // Preserve source indentation for computing relative child depth
             const indentMatch = taskLine.match(/^(\s*)/);
             const indent = indentMatch ? indentMatch[0] : '';
+
+            // If this is a subtask, carry its parent chain to the destination as
+            // plain-bullet context so it doesn't arrive orphaned. Parents render
+            // as bullets (not tasks) at increasing depth; the task nests beneath.
+            const contextParents = isNewTask || type === '.' || isInfoPoint
+                ? []
+                : await this.collectAncestorContext(sourceFilePath, taskLine);
+            const taskBaseIndent = '\t'.repeat(contextParents.length);
+            const contextLines = contextParents.map((text, i) => `${'\t'.repeat(i)}- ${text}`);
+
             // For information points (type === '.'), destMarker is empty, so format is: - Information text
             // For other types, format is: - [marker] text
             const destTaskLine = type === '.'
-                ? `${indent}- ${cleanTaskText}`
-                : `${indent}- ${destMarker} ${cleanTaskText}`;
+                ? `${taskBaseIndent}- ${cleanTaskText}`
+                : `${taskBaseIndent}- ${destMarker} ${cleanTaskText}`;
             console.log(`[BuJo] Destination task line: ${destTaskLine}`);
 
             // Process child tasks - Only incomplete children migrate with parent to preserve hierarchy
@@ -1679,15 +1278,16 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
                 const childIndentMatch = child.line.match(/^(\s*)/);
                 const childIndent = childIndentMatch ? childIndentMatch[0] : '';
 
-                // Calculate relative indent from parent (maintain hierarchy)
-                // Preserve original indentation style (tabs vs spaces) by extracting
-                // the actual characters used for the relative indent
+                // Calculate indent from parent (maintain hierarchy). Preserve
+                // original indentation style (tabs vs spaces) for the relative
+                // portion, then rebase onto the task's destination indent so
+                // children stay nested when the task itself was re-indented
+                // (e.g. a subtask carrying parent context).
                 const parentIndentLength = indent.length;
-                // Extract the portion of child indent that goes beyond parent indent
-                // This preserves tabs/spaces exactly as they appear in the source
-                const destChildIndent = parentIndentLength < childIndent.length
+                const relativeChildIndent = parentIndentLength < childIndent.length
                     ? childIndent.substring(parentIndentLength)
                     : '\t'; // Default to tab if child was at same level (shouldn't happen normally)
+                const destChildIndent = `${taskBaseIndent}${relativeChildIndent}`;
 
                 // Determine child type and descriptor (from migration marker if present, otherwise preserve original)
                 const childType = childParsed ? childParsed.type : null;
@@ -1772,8 +1372,8 @@ const normalizedTaskText = this.normalizeText(taskTextClean);
                 }
             }
             
-            // Combine parent and children for destination (incomplete children only)
-            const allDestLines = [destTaskLine, ...destChildLines];
+            // Combine context parents, task, and children for the destination
+            const allDestLines = [...contextLines, destTaskLine, ...destChildLines];
 
             // For information points ([-] notation), don't add migration marker - just remove the migration marker
             let updatedSourceLine;
