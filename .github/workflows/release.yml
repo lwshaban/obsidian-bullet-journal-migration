@@ -1,0 +1,53 @@
+name: Release
+
+# Obsidian resolves a plugin release by looking for a tag that exactly matches
+# manifest.json's version — no "v" prefix. Tag as "0.4.0", not "v0.4.0".
+on:
+    push:
+        tags:
+            - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+    contents: write
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "22.x"
+                  cache: "npm"
+
+            - run: npm ci
+
+            - name: Verify tag matches manifest version
+              run: |
+                  TAG="${GITHUB_REF_NAME}"
+                  MANIFEST_VERSION="$(jq -r .version manifest.json)"
+                  if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+                      echo "Tag $TAG does not match manifest.json version $MANIFEST_VERSION" >&2
+                      exit 1
+                  fi
+                  if [ "$(jq -r --arg v "$TAG" '.[$v] // empty' versions.json)" = "" ]; then
+                      echo "versions.json has no entry for $TAG" >&2
+                      exit 1
+                  fi
+
+            - run: npm run lint
+
+            - run: npm test
+
+            - run: npm run build
+
+            - name: Create release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh release create "${GITHUB_REF_NAME}" \
+                      --title "${GITHUB_REF_NAME}" \
+                      --generate-notes \
+                      main.js manifest.json styles.css
