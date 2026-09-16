@@ -1,7 +1,7 @@
 // Bullet Journal Migration System
 // Provides weekly and monthly review generation and processing
 
-import { App, Notice, TFile, moment, Editor } from 'obsidian';
+import { App, TFile, moment, Editor } from 'obsidian';
 import { MigrationMarker, MigrationResult, TaskType, PeriodType, ChildTask, DestinationDate } from './types';
 import {
 	normalizeText,
@@ -14,18 +14,68 @@ import {
 	getBulletMarker,
 	getIndentLevel,
 	removeMetadata,
-	collectChildTasks,
-	tryParseHeadingPath,
-} from './utils';
+	collectChildTasks,} from './utils';
 import { locateTaskLine, descendantLines, ancestorLines } from './locate';
 import { resolveRelativeMarker } from './markers';
 import { computeRecurrence, RecurUnit } from './recurrence';
+import { BujoPaths } from './paths';
+import { BujoPluginSettings } from './settings';
+import { log } from './log';
+import * as reviews from './reviews';
+import * as taskCommands from './task-commands';
+
+/** The slice of Templater's plugin instance this code calls into. */
+interface TemplaterPlugin {
+	templater: {
+		overwrite_file_commands(file: TFile): Promise<void>;
+	};
+}
+
+/** `App.plugins` is undocumented but stable; typed here rather than cast inline. */
+type AppWithPlugins = App & {
+	plugins?: { plugins?: Record<string, unknown> };
+};
 
 export class BulletJournalMigration {
 	app: App;
 
-	constructor(app: App) {
+	/**
+	 * Settings are read through a getter so edits in the settings tab take
+	 * effect immediately, without reloading the plugin.
+	 */
+	constructor(app: App, private getSettings: () => BujoPluginSettings) {
 		this.app = app;
+	}
+
+	get paths(): BujoPaths {
+		return new BujoPaths(this.getSettings());
+	}
+
+	/**
+	 * Templater, when the user has it installed. `App.plugins` is not part of
+	 * the public API, so the shape is asserted narrowly and guarded at runtime.
+	 */
+	getTemplater(): TemplaterPlugin | null {
+		const plugins = (this.app as AppWithPlugins).plugins?.plugins;
+		const templater = plugins?.['templater-obsidian'];
+		if (templater && typeof templater === 'object' && 'templater' in templater) {
+			return templater as TemplaterPlugin;
+		}
+		return null;
+	}
+
+	/** Resolve a vault path to a markdown file, or null if missing or a folder. */
+	getFile(path: string): TFile | null {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		return file instanceof TFile ? file : null;
+	}
+
+	/**
+	 * Move a file to the vault trash, honouring the user's "Deleted files"
+	 * preference. Never use vault.delete() for user content — it is permanent.
+	 */
+	async trashFile(file: TFile): Promise<void> {
+		await this.app.fileManager.trashFile(file);
 	}
 
     // =================================================================
@@ -293,39 +343,8 @@ export class BulletJournalMigration {
     /**
      * Get file path for target
      */
-    getTargetFilePath(date: string | null, targetType: string, monthName: string | null = null): string {
-        if (targetType === 'future') {
-            // Extract year from date if provided, otherwise use current year
-            let year = moment().year();
-            if (date) {
-                const dateMoment = moment(date, 'YYYY-MM-DD');
-                if (dateMoment.isValid()) {
-                    year = dateMoment.year();
-                }
-            }
-            return `Journal/006 Future Log/${year} - Future Log.md`;
-        }
-
-        if (!date) {
-            throw new Error(`Date is required for target type: ${targetType}`);
-        }
-
-        const dateMoment = moment(date, 'YYYY-MM-DD');
-
-        if (targetType === 'daily') {
-            return `Journal/001 Daily Notes/${date}.md`;
-        } else if (targetType === 'weekly') {
-            const weekNumber = dateMoment.isoWeek();
-            const year = dateMoment.year();
-            return `Journal/002 Weekly Notes/${year}-W${String(weekNumber).padStart(2, '0')}.md`;
-        } else if (targetType === 'monthly') {
-            return `Journal/003 Monthly Notes/${dateMoment.format('YYYY-MM')}.md`;
-        } else if (targetType === 'yearly') {
-            const year = dateMoment.year();
-            return `Journal/004 Yearly Notes/${year}.md`;
-        }
-
-        throw new Error(`Unknown target type: ${targetType}`);
+    getTargetFilePath(date: string | null, targetType: string): string {
+        return this.paths.targetFilePath(date, targetType);
     }
 
     /**
@@ -401,10 +420,7 @@ export class BulletJournalMigration {
      * Detect period type from file path
      */
     detectPeriodType(filePath: string): PeriodType {
-        if (filePath.includes('Daily Notes')) return 'daily';
-        if (filePath.includes('Weekly Notes')) return 'weekly';
-        if (filePath.includes('Monthly Notes')) return 'monthly';
-        return 'daily';
+        return this.paths.detectPeriodType(filePath);
     }
 
     /**
@@ -418,7 +434,7 @@ export class BulletJournalMigration {
         if (weeklyMatch && weeklyMatch[1] && weeklyMatch[2]) {
             const year = parseInt(weeklyMatch[1], 10);
             const week = parseInt(weeklyMatch[2], 10);
-            return moment().year(year).isoWeek(week).startOf('isoWeek').format('YYYY-MM-DD');
+            return moment().isoWeekYear(year).isoWeek(week).startOf('isoWeek').format('YYYY-MM-DD');
         }
 
         const monthlyMatch = filePath.match(/(\d{4}-\d{2})\.md$/);
@@ -431,11 +447,7 @@ export class BulletJournalMigration {
      * Get template path based on file type
      */
     getTemplatePath(filePath: string): string | null {
-        if (filePath.includes('Daily Notes')) return 'Obsidian/Templator/Journal/Daily-Template.md';
-        if (filePath.includes('Weekly Notes')) return 'Obsidian/Templator/Journal/Weekly-Template.md';
-        if (filePath.includes('Monthly Notes')) return 'Obsidian/Templator/Journal/Monthly-Template.md';
-        if (filePath.includes('Future Log')) return 'Obsidian/Templator/Journal/Future-Log-Template.md';
-        return null;
+        return this.paths.templateFor(filePath);
     }
 
     // =================================================================
@@ -447,13 +459,13 @@ export class BulletJournalMigration {
      * Also includes items with migration markers (for non-task items like events, information, etc.)
      */
     async getIncompleteTasks(filePath: string): Promise<string[]> {
-        console.log(`[BuJo] *** getIncompleteTasks called for: ${filePath}`);
+        log.debug(`*** getIncompleteTasks called for: ${filePath}`);
         const file = this.app.vault.getAbstractFileByPath(filePath);
         if (!file || !(file instanceof TFile)) return [];
 
         const content = await this.app.vault.read(file);
         const lines = content.split('\n');
-        console.log(`[BuJo] *** Processing ${lines.length} lines from ${filePath}`);
+        log.debug(`*** Processing ${lines.length} lines from ${filePath}`);
         return lines.filter(line => {
             const trimmed = line.trim();
             
@@ -461,7 +473,7 @@ export class BulletJournalMigration {
             // [-] = cancelled, [x] = completed, [>] = migrated, [<] = scheduled elsewhere, [+] = new task created
             // Note: Check trimmed line since tasks may have leading whitespace
             if (/^-\s*\[(-|x|>|<|\+)\]/i.test(trimmed)) {
-                console.log(`[BuJo] Excluding already-processed task from review: "${trimmed.substring(0, 50)}"`);
+                log.debug(`Excluding already-processed task from review: "${trimmed.substring(0, 50)}"`);
                 return false;
             }
             
@@ -485,29 +497,29 @@ export class BulletJournalMigration {
         const templateFile = this.app.vault.getAbstractFileByPath(templatePath);
 
         if (!templateFile || !(templateFile instanceof TFile)) {
-            console.warn(`[BuJo] Template not found: ${templatePath}, creating empty file: ${filePath}`);
+            log.warn(`Template not found: ${templatePath}, creating empty file: ${filePath}`);
             await this.app.vault.create(filePath, '');
             return;
         }
 
-        console.log(`[BuJo] Creating ${filePath} from template ${templatePath}`);
+        log.debug(`Creating ${filePath} from template ${templatePath}`);
         let templateContent = await this.app.vault.read(templateFile);
 
         // Try to use Templater if available
-        const templater = (this.app as any).plugins?.plugins?.['templater-obsidian'];
+        const templater = this.getTemplater();
         if (templater) {
             try {
                 const newFile = await this.app.vault.create(filePath, templateContent);
                 await templater.templater.overwrite_file_commands(newFile);
-                console.log(`[BuJo] Successfully created ${filePath} from template with Templater`);
+                log.debug(`Successfully created ${filePath} from template with Templater`);
                 return;
             } catch (error) {
-                console.warn(`[BuJo] Templater processing failed for ${filePath}:`, error);
+                log.warn(`Templater processing failed for ${filePath}:`, error);
             }
         }
 
         await this.app.vault.create(filePath, templateContent);
-        console.log(`[BuJo] Successfully created ${filePath} from template`);
+        log.debug(`Successfully created ${filePath} from template`);
     }
 
     /**
@@ -521,6 +533,7 @@ export class BulletJournalMigration {
         if (!taskLine) {
             throw new Error('No task line provided to append');
         }
+        const kind = this.paths.classify(filePath);
         let file = this.app.vault.getAbstractFileByPath(filePath);
 
         if (!file || !(file instanceof TFile)) {
@@ -530,22 +543,22 @@ export class BulletJournalMigration {
                 try {
                     await this.app.vault.createFolder(folderPath);
                 } catch (error) {
-                    console.warn(`[BuJo] createFolder raced for ${folderPath} (already exists?):`, error);
+                    log.warn(`createFolder raced for ${folderPath} (already exists?):`, error);
                 }
             }
 
             const templatePath = this.getTemplatePath(filePath);
             if (templatePath) {
-                console.log(`[BuJo] Creating file from template: ${filePath} using ${templatePath}`);
+                log.debug(`Creating file from template: ${filePath} using ${templatePath}`);
                 await this.createFromTemplate(filePath, templatePath);
                 file = this.app.vault.getAbstractFileByPath(filePath);
                 if (!file || !(file instanceof TFile)) {
-                    console.warn(`[BuJo] Template creation failed, creating empty file: ${filePath}`);
+                    log.warn(`Template creation failed, creating empty file: ${filePath}`);
                     await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
                     return;
                 }
             } else {
-                console.log(`[BuJo] No template found, creating file: ${filePath}`);
+                log.debug(`No template found, creating file: ${filePath}`);
                 try {
                     await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
                     return;
@@ -565,7 +578,7 @@ export class BulletJournalMigration {
         let insertIndex = lines.length;
 
         // Handle future log format - find the correct section
-        if (filePath.includes('Future Log')) {
+        if (kind === 'future') {
             // Use "General" section if no month specified, otherwise use month section
             const sectionHeading = monthName ? `## ${monthName}` : '## General';
             const sectionIndex = lines.findIndex(line => line.trim() === sectionHeading);
@@ -591,14 +604,14 @@ export class BulletJournalMigration {
                 }
 
                 insertIndex = lastTaskIndex + 1;
-                console.log(`[BuJo] Found ${sectionHeading} section, inserting task at line ${insertIndex}`);
+                log.debug(`Found ${sectionHeading} section, inserting task at line ${insertIndex}`);
             } else {
-                console.log(`[BuJo] Section ${sectionHeading} not found in future log, appending to end`);
+                log.debug(`Section ${sectionHeading} not found in future log, appending to end`);
             }
         } else {
             // Determine which section to use based on file type
             let sectionName = '## Notes'; // Default for daily notes
-            if (filePath.includes('Weekly Notes') || filePath.includes('Monthly Notes')) {
+            if (kind === 'weekly' || kind === 'monthly') {
                 sectionName = '## Plan';
             }
 
@@ -607,9 +620,9 @@ export class BulletJournalMigration {
             if (sectionIndex !== -1) {
                 // Insert right after the section heading (at the top of the section)
                 insertIndex = sectionIndex + 1;
-                console.log(`[BuJo] Found ${sectionName} section at line ${sectionIndex}, inserting at ${insertIndex}`);
+                log.debug(`Found ${sectionName} section at line ${sectionIndex}, inserting at ${insertIndex}`);
             } else {
-                console.log(`[BuJo] ${sectionName} section not found, appending to end of file`);
+                log.debug(`${sectionName} section not found, appending to end of file`);
             }
         }
 
@@ -630,7 +643,7 @@ export class BulletJournalMigration {
         });
 
         if (existingTaskIndex !== -1) {
-            console.log(`[BuJo] Task already exists in ${filePath}, skipping duplicate: "${this.getTaskText(primaryLine)}"`);
+            log.debug(`Task already exists in ${filePath}, skipping duplicate: "${this.getTaskText(primaryLine)}"`);
             return content; // Skip adding duplicate task
         }
 
@@ -665,14 +678,14 @@ export class BulletJournalMigration {
                 const rebased = body.map(l => l.startsWith(bodyBase) ? targetBase + l.slice(bodyBase.length) : l);
 
                 lines.splice(subtreeEnd, 0, ...rebased);
-                console.log(`[BuJo] Nested ${rebased.length} line(s) under existing parent "${this.getTaskText(parentLine)}" in ${filePath}`);
+                log.debug(`Nested ${rebased.length} line(s) under existing parent "${this.getTaskText(parentLine)}" in ${filePath}`);
                 return lines.join('\n');
             }
         }
 
         // Not a duplicate and no existing parent - append the whole batch
         lines.splice(insertIndex, 0, ...taskLines);
-        console.log(`[BuJo] Appended ${taskLines.length} line(s) to ${filePath}: ${taskLine}`);
+        log.debug(`Appended ${taskLines.length} line(s) to ${filePath}: ${taskLine}`);
         return lines.join('\n');
         });
     }
@@ -728,7 +741,7 @@ export class BulletJournalMigration {
             const targetMarker = newLineTrimmed.match(/^-\s*\[([^\]]+)\]/);
             const currentMarker = line.match(/^\s*-\s*\[([^\]]+)\]/);
             if (targetMarker && currentMarker && targetMarker[1] === currentMarker[1]) {
-                console.log(`[BuJo] Task already in target state [${targetMarker[1]}], skipping update`);
+                log.debug(`Task already in target state [${targetMarker[1]}], skipping update`);
                 return content;
             }
 
@@ -741,9 +754,9 @@ export class BulletJournalMigration {
 
         if (!found) {
             const oldTaskTextClean = this.removeMetadata(this.getTaskText(oldLine)).trim();
-            console.error(`[BuJo] Task not found in file: ${filePath}`);
-            console.error(`[BuJo] Looking for: "${oldTaskTextClean}"`);
-            console.error(`[BuJo] Original line: "${oldLine.substring(0, 100)}"`);
+            log.error(`Task not found in file: ${filePath}`);
+            log.error(`Looking for: "${oldTaskTextClean}"`);
+            log.error(`Original line: "${oldLine.substring(0, 100)}"`);
             throw new Error(`Task not found: "${oldTaskTextClean.substring(0, 50)}..." in ${filePath}`);
         }
     }
@@ -784,7 +797,7 @@ export class BulletJournalMigration {
             });
 
             if (!found) {
-                console.error(`[BuJo] Task not found to ${verb}: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
+                log.error(`Task not found to ${verb}: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
                 return { success: false, error: 'Task not found' };
             }
             return { success: true };
@@ -858,15 +871,15 @@ export class BulletJournalMigration {
             });
 
             if (removedCount === 0) {
-                console.error(`[BuJo] Task not found to remove: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
+                log.error(`Task not found to remove: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
                 return { success: false, error: 'Task not found' };
             }
 
-            console.log(`[BuJo] Removed task and ${removedCount - 1} children from ${sourceFilePath}`);
+            log.debug(`Removed task and ${removedCount - 1} children from ${sourceFilePath}`);
             return { success: true };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error(`[BuJo] Error removing task:`, error);
+            log.error(`Error removing task:`, error);
             return { success: false, error: errorMessage };
         }
     }
@@ -911,20 +924,20 @@ export class BulletJournalMigration {
 
             // Use current date if no review date provided
             const sourceDate = reviewDate || moment().format('YYYY-MM-DD');
-            console.log(`[BuJo] Creating new task with marker: ${marker}, type: ${type}, descriptor: ${descriptor}, sourceDate: ${sourceDate}`);
+            log.debug(`Creating new task with marker: ${marker}, type: ${type}, descriptor: ${descriptor}, sourceDate: ${sourceDate}`);
             
             const destination = this.calculateDestinationDate(marker, sourceDate, 'daily');
             if (!destination) {
                 return { success: false, error: `Invalid destination marker: ${marker}` };
             }
-            console.log(`[BuJo] New task destination:`, destination);
+            log.debug(`New task destination:`, destination);
 
-            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType, destination.monthName);
-            console.log(`[BuJo] New task target file: ${targetFilePath}`);
+            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
+            log.debug(`New task target file: ${targetFilePath}`);
 
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
-            console.log(`[BuJo] New task text: "${taskText}", cleaned: "${cleanTaskText}"`);
+            log.debug(`New task text: "${taskText}", cleaned: "${cleanTaskText}"`);
 
             // Preserve indentation from original line
             const indentMatch = taskLine.match(/^(\s*)/);
@@ -942,29 +955,29 @@ export class BulletJournalMigration {
                     !origMarker.startsWith('>') && !origMarker.startsWith('<') && !origMarker.startsWith('+>')) {
                     destMarker = `[${origMarker}]`;
                 } else {
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
             } else {
-                destMarker = this.getDestinationMarker(type as TaskType);
+                destMarker = this.getDestinationMarker(type);
             }
             // For information points (type === '.'), destMarker is empty, so format is: - Information text
             // For other types, format is: - [marker] text
             const destTaskLine = type === '.'
                 ? `${indent}- ${cleanTaskText}`
                 : `${indent}- ${destMarker} ${cleanTaskText}`;
-            console.log(`[BuJo] New task line: ${destTaskLine}`);
+            log.debug(`New task line: ${destTaskLine}`);
 
             try {
                 await this.appendToFile(targetFilePath, destTaskLine, destination.monthName || null);
-                console.log(`[BuJo] Successfully created new task in ${targetFilePath}`);
+                log.debug(`Successfully created new task in ${targetFilePath}`);
                 return { success: true, destFile: targetFilePath };
             } catch (error) {
-                console.error(`[BuJo] Failed to create new task in ${targetFilePath}:`, error);
+                log.error(`Failed to create new task in ${targetFilePath}:`, error);
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 return { success: false, error: `Failed to create task: ${errorMessage}` };
             }
         } catch (error) {
-            console.error(`[BuJo] Create new task error:`, error);
+            log.error(`Create new task error:`, error);
             const errorMessage = error instanceof Error ? error.message : String(error);
             return { success: false, error: errorMessage };
         }
@@ -980,7 +993,7 @@ export class BulletJournalMigration {
         try {
             const sourceFile = this.app.vault.getAbstractFileByPath(sourceFilePath);
             if (!sourceFile || !(sourceFile instanceof TFile)) {
-                console.log(`[BuJo] Source file not found: ${sourceFilePath}`);
+                log.debug(`Source file not found: ${sourceFilePath}`);
                 return [];
             }
             
@@ -991,7 +1004,7 @@ export class BulletJournalMigration {
             // Locate the parent (exact, then normalized text — no fuzzy matching)
             const parentIndex = locateTaskLine(lines, `- ${parentTaskText}`, cache, (l) => this.isBulletItem(l));
             if (parentIndex === -1) {
-                console.log(`[BuJo] Parent task not found in source file: ${sourceFilePath}, looking for: "${parentTaskText}"`);
+                log.debug(`Parent task not found in source file: ${sourceFilePath}, looking for: "${parentTaskText}"`);
                 return [];
             }
             const parentLine = lines[parentIndex];
@@ -1013,17 +1026,17 @@ export class BulletJournalMigration {
                     children.push({ line, index: n, indent });
                 }
                 if (children.length > 0) {
-                    console.log(`[BuJo] Found ${children.length} child task(s) via metadata cache for parent at line ${parentIndex + 1}`);
+                    log.debug(`Found ${children.length} child task(s) via metadata cache for parent at line ${parentIndex + 1}`);
                     return children;
                 }
             }
 
             const childTasks = this.collectChildTasks(lines, parentIndex, parentIndent);
-            console.log(`[BuJo] Found ${childTasks.length} child task(s) for parent in source file at line ${parentIndex + 1}`);
+            log.debug(`Found ${childTasks.length} child task(s) for parent in source file at line ${parentIndex + 1}`);
             return childTasks;
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error(`[BuJo] Error collecting children from source: ${errorMessage}`);
+            log.error(`Error collecting children from source: ${errorMessage}`);
             return [];
         }
     }
@@ -1073,7 +1086,7 @@ export class BulletJournalMigration {
                 .filter(text => text.length > 0);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error(`[BuJo] Error collecting ancestor context: ${errorMessage}`);
+            log.error(`Error collecting ancestor context: ${errorMessage}`);
             return [];
         }
     }
@@ -1087,24 +1100,24 @@ export class BulletJournalMigration {
             const parsed = this.parseMigrationMarker(taskLine);
             if (!parsed) return { success: false, error: 'No migration marker found' };
 
-            const { marker, type, sourceType, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
+            const { marker, type, sourceType, isNewTask = false, isInfoPoint = false } = parsed;
 
             // Auto-collect children from source file if none provided
             if (childTasks.length === 0 && !isNewTask) {
                 const taskText = this.getTaskText(taskLine);
                 childTasks = await this.collectChildrenFromSource(sourceFilePath, taskText);
                 if (childTasks.length > 0) {
-                    console.log(`[BuJo] Auto-collected ${childTasks.length} children for task: "${taskText.substring(0, 40)}"`);
+                    log.debug(`Auto-collected ${childTasks.length} children for task: "${taskText.substring(0, 40)}"`);
                 }
             }
 
             // Handle new task marker [+> - don't update source, just create destination
             if (isNewTask) {
-            const destination = this.calculateDestinationDate(marker, sourceDate, periodType as PeriodType);
+            const destination = this.calculateDestinationDate(marker, sourceDate, periodType);
             if (!destination) {
                 return { success: false, error: `Invalid destination marker: ${marker}` };
             }
-            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType, destination.monthName);
+            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
 
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
@@ -1123,10 +1136,10 @@ export class BulletJournalMigration {
                         !origMarker.startsWith('>') && !origMarker.startsWith('<') && !origMarker.startsWith('+>')) {
                         destMarker = `[${origMarker}]`;
                     } else {
-                        destMarker = this.getDestinationMarker(type as TaskType);
+                        destMarker = this.getDestinationMarker(type);
                     }
                 } else {
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
                 // For information points (type === '.'), destMarker is empty, so format is: - Information text
                 // For other types, format is: - [marker] text
@@ -1134,14 +1147,14 @@ export class BulletJournalMigration {
                     ? `${indent}- ${cleanTaskText}`
                     : `${indent}- ${destMarker} ${cleanTaskText}`;
 
-                console.log(`[BuJo] Creating new task (no source update): "${cleanTaskText}" -> ${targetFilePath}`);
+                log.debug(`Creating new task (no source update): "${cleanTaskText}" -> ${targetFilePath}`);
 
                 try {
                     await this.appendToFile(targetFilePath, destTaskLine, destination.monthName || null);
-                    console.log(`[BuJo] Successfully created new task in ${targetFilePath}`);
+                    log.debug(`Successfully created new task in ${targetFilePath}`);
                     return { success: true, sourceFile: null, destFile: targetFilePath, isNewTask: true };
                 } catch (error) {
-                    console.error(`[BuJo] Failed to create new task in ${targetFilePath}:`, error);
+                    log.error(`Failed to create new task in ${targetFilePath}:`, error);
                     const errorMessage = error instanceof Error ? error.message : String(error);
                     return { success: false, error: `Failed to create task: ${errorMessage}` };
                 }
@@ -1174,7 +1187,7 @@ export class BulletJournalMigration {
                 let foundParent = false;
                 let childrenMarkedCount = 0;
 
-                console.log(`[BuJo] Looking for task to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
+                log.debug(`Looking for task to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
 
                 // Mark parent and its incomplete children in one atomic pass
                 await this.app.vault.process(sourceFile, (content) => {
@@ -1198,26 +1211,26 @@ export class BulletJournalMigration {
                 });
 
                 if (!foundParent) {
-                    console.error(`[BuJo] Task not found to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
+                    log.error(`Task not found to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
                     return { success: false, error: 'Task not found' };
                 }
 
-                console.log(`[BuJo] Marked parent and ${childrenMarkedCount} child task(s) as ${marker}`);
+                log.debug(`Marked parent and ${childrenMarkedCount} child task(s) as ${marker}`);
                 return { success: true, sourceFile: sourceFilePath, destFile: null, skipped: true, childrenMarked: childrenMarkedCount };
             }
 
-            const destination = this.calculateDestinationDate(marker, sourceDate, periodType as PeriodType);
+            const destination = this.calculateDestinationDate(marker, sourceDate, periodType);
             if (!destination) {
                 return { success: false, error: `Invalid destination marker: ${marker}` };
             }
-            console.log(`[BuJo] Migration destination calculated:`, { marker, sourceDate, periodType, destination });
+            log.debug(`Migration destination calculated:`, { marker, sourceDate, periodType, destination });
 
-            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType, destination.monthName);
-            console.log(`[BuJo] Target file path: ${targetFilePath}`);
+            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
+            log.debug(`Target file path: ${targetFilePath}`);
 
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
-            console.log(`[BuJo] Task text: "${taskText}", cleaned: "${cleanTaskText}"`);
+            log.debug(`Task text: "${taskText}", cleaned: "${cleanTaskText}"`);
 
             // Preserve original bullet type if no type specified, otherwise use destination marker
             const originalBulletMarker = this.getBulletMarker(taskLine);
@@ -1235,12 +1248,12 @@ export class BulletJournalMigration {
                     destMarker = `[${origMarker}]`;
                 } else {
                     // Default to task marker
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
             } else {
                 // No original marker - could be plain list item (information point)
                 // If no type specified, preserve as plain list item, otherwise use destination marker
-                destMarker = this.getDestinationMarker(type as TaskType);
+                destMarker = this.getDestinationMarker(type);
             }
             
             // Preserve source indentation for computing relative child depth
@@ -1261,7 +1274,7 @@ export class BulletJournalMigration {
             const destTaskLine = type === '.'
                 ? `${taskBaseIndent}- ${cleanTaskText}`
                 : `${taskBaseIndent}- ${destMarker} ${cleanTaskText}`;
-            console.log(`[BuJo] Destination task line: ${destTaskLine}`);
+            log.debug(`Destination task line: ${destTaskLine}`);
 
             // Process child tasks - Only incomplete children migrate with parent to preserve hierarchy
             const destChildLines = [];
@@ -1270,7 +1283,7 @@ export class BulletJournalMigration {
             for (const child of childTasks) {
                 // Skip completed and cancelled children - they stay in source
                 if (this.isCompletedTask(child.line) || this.isDeletedTask(child.line)) {
-                    console.log(`[BuJo] Skipping completed/cancelled child: "${this.getTaskText(child.line)}"`);
+                    log.debug(`Skipping completed/cancelled child: "${this.getTaskText(child.line)}"`);
                     continue;
                 }
 
@@ -1291,8 +1304,6 @@ export class BulletJournalMigration {
 
                 // Determine child type and descriptor (from migration marker if present, otherwise preserve original)
                 const childType = childParsed ? childParsed.type : null;
-                const childDescriptor = childParsed ? childParsed.descriptor : null;
-                const childOriginalMarker = childParsed ? childParsed.originalMarker : null;
 
                 const childText = this.getTaskText(child.line);
                 const childCleanText = this.removeMetadata(childText);
@@ -1348,7 +1359,7 @@ export class BulletJournalMigration {
                     if (!hasCheckbox) {
                         // Plain information point (no checkbox) - keep in source AND migrate to destination
                         // Don't add to updatedChildLines or childIndicesToUpdate - leave source unchanged
-                        console.log(`[BuJo] Plain info point child stays in source: "${childCleanText}"`);
+                        log.debug(`Plain info point child stays in source: "${childCleanText}"`);
                         continue;
                     }
 
@@ -1367,7 +1378,7 @@ export class BulletJournalMigration {
                         childIndicesToUpdate.push(child);
                     } else {
                         // Completed/cancelled task reached this point - skip it (safety fallback)
-                        console.log(`[BuJo] Skipping completed/cancelled child in fallback: "${this.getTaskText(child.line)}"`);
+                        log.debug(`Skipping completed/cancelled child in fallback: "${this.getTaskText(child.line)}"`);
                     }
                 }
             }
@@ -1389,18 +1400,18 @@ export class BulletJournalMigration {
                 const origMarker = this.getOriginalMarker(marker, type, sourceType);
                 updatedSourceLine = taskLine.replace(/^(\s*-\s*)\[[^\]]+\]/, `$1[${origMarker}]`);
             }
-            console.log(`[BuJo] Updated source line: ${updatedSourceLine}`);
+            log.debug(`Updated source line: ${updatedSourceLine}`);
 
             try {
                 await this.appendToFile(targetFilePath, allDestLines, destination.monthName);
                 const migratedChildrenCount = destChildLines.length;
                 if (migratedChildrenCount > 0) {
-                    console.log(`[BuJo] Successfully appended ${allDestLines.length} line(s) (parent + ${migratedChildrenCount} migrated children) to ${targetFilePath}`);
+                    log.debug(`Successfully appended ${allDestLines.length} line(s) (parent + ${migratedChildrenCount} migrated children) to ${targetFilePath}`);
                 } else {
-                    console.log(`[BuJo] Successfully appended parent task to ${targetFilePath} (${childTasks.length} children without markers stayed in source)`);
+                    log.debug(`Successfully appended parent task to ${targetFilePath} (${childTasks.length} children without markers stayed in source)`);
                 }
             } catch (error) {
-                console.error(`[BuJo] Failed to append task to ${targetFilePath}:`, error);
+                log.error(`Failed to append task to ${targetFilePath}:`, error);
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 return { success: false, error: `Failed to append to destination: ${errorMessage}` };
             }
@@ -1422,7 +1433,7 @@ export class BulletJournalMigration {
                             } catch (childError) {
                                 childUpdateErrors++;
                                 const childTaskText = this.getTaskText(child.line);
-                                console.error(`[BuJo] Failed to update child task "${childTaskText.substring(0, 50)}" in ${sourceFilePath}:`, childError);
+                                log.error(`Failed to update child task "${childTaskText.substring(0, 50)}" in ${sourceFilePath}:`, childError);
                                 // Continue processing other children instead of failing completely
                             }
                         }
@@ -1431,22 +1442,22 @@ export class BulletJournalMigration {
                     const migratedChildrenCount = childIndicesToUpdate.length;
                     const successfulChildUpdates = migratedChildrenCount - childUpdateErrors;
                     if (migratedChildrenCount > 0) {
-                        console.log(`[BuJo] Successfully updated source file ${sourceFilePath} (parent + ${successfulChildUpdates}/${migratedChildrenCount} migrated children${childUpdateErrors > 0 ? `, ${childUpdateErrors} child updates failed` : ''})`);
+                        log.debug(`Successfully updated source file ${sourceFilePath} (parent + ${successfulChildUpdates}/${migratedChildrenCount} migrated children${childUpdateErrors > 0 ? `, ${childUpdateErrors} child updates failed` : ''})`);
                     } else {
-                        console.log(`[BuJo] Successfully updated source file ${sourceFilePath} (parent only, ${childTasks.length - migratedChildrenCount} children without markers stayed)`);
+                        log.debug(`Successfully updated source file ${sourceFilePath} (parent only, ${childTasks.length - migratedChildrenCount} children without markers stayed)`);
                     }
                 } catch (error) {
-                    console.error(`[BuJo] Failed to update parent task in source file ${sourceFilePath}:`, error);
+                    log.error(`Failed to update parent task in source file ${sourceFilePath}:`, error);
                     const errorMessage = error instanceof Error ? error.message : String(error);
                     return { success: false, error: `Failed to update source: ${errorMessage}` };
                 }
             } else if (isNewTask) {
-                console.log(`[BuJo] Skipping source update for new task marker [+>`);
+                log.debug(`Skipping source update for new task marker [+>`);
             }
 
             return { success: true, sourceFile: sourceFilePath, destFile: targetFilePath };
         } catch (error) {
-            console.error(`[BuJo] Migration error:`, error);
+            log.error(`Migration error:`, error);
             const errorMessage = error instanceof Error ? error.message : String(error);
             return { success: false, error: errorMessage };
         }
@@ -1461,24 +1472,24 @@ export class BulletJournalMigration {
             const parsed = this.parseMigrationMarker(taskLine);
             if (!parsed) return { success: false, error: 'No migration marker found' };
 
-            const { marker, type, sourceType, descriptor, originalMarker, isNewTask = false, isInfoPoint = false } = parsed;
+            const { marker, type, originalMarker, isNewTask = false } = parsed;
 
             // Auto-collect children from source file if none provided
             if (childTasks.length === 0 && !isNewTask) {
                 const taskText = this.getTaskText(taskLine);
                 childTasks = await this.collectChildrenFromSource(sourceFilePath, taskText);
                 if (childTasks.length > 0) {
-                    console.log(`[BuJo] Auto-collected ${childTasks.length} children for scheduling: "${taskText.substring(0, 40)}"`);
+                    log.debug(`Auto-collected ${childTasks.length} children for scheduling: "${taskText.substring(0, 40)}"`);
                 }
             }
 
             // Handle new task marker [+> - don't update source, just create destination
             if (isNewTask) {
-                const destination = this.calculateDestinationDate(marker, sourceDate, periodType as PeriodType);
+                const destination = this.calculateDestinationDate(marker, sourceDate, periodType);
                 if (!destination) {
                     return { success: false, error: `Invalid destination marker: ${marker}` };
                 }
-                const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType, destination.monthName);
+                const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
 
                 const taskText = this.getTaskText(taskLine);
                 const cleanTaskText = this.removeMetadata(taskText);
@@ -1497,10 +1508,10 @@ export class BulletJournalMigration {
                         !origMarker.startsWith('>') && !origMarker.startsWith('<') && !origMarker.startsWith('+>')) {
                         destMarker = `[${origMarker}]`;
                     } else {
-                        destMarker = this.getDestinationMarker(type as TaskType);
+                        destMarker = this.getDestinationMarker(type);
                     }
                 } else {
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
                 // For information points (type === '.'), destMarker is empty, so format is: - Information text
                 // For other types, format is: - [marker] text
@@ -1508,14 +1519,14 @@ export class BulletJournalMigration {
                     ? `${indent}- ${cleanTaskText}`
                     : `${indent}- ${destMarker} ${cleanTaskText}`;
 
-                console.log(`[BuJo] Creating new task (no source update): "${cleanTaskText}" -> ${targetFilePath}`);
+                log.debug(`Creating new task (no source update): "${cleanTaskText}" -> ${targetFilePath}`);
 
                 try {
                     await this.appendToFile(targetFilePath, destTaskLine, destination.monthName || null);
-                    console.log(`[BuJo] Successfully created new task in ${targetFilePath}`);
+                    log.debug(`Successfully created new task in ${targetFilePath}`);
                     return { success: true, sourceFile: null, destFile: targetFilePath, isNewTask: true };
                 } catch (error) {
-                    console.error(`[BuJo] Failed to create new task in ${targetFilePath}:`, error);
+                    log.error(`Failed to create new task in ${targetFilePath}:`, error);
                     const errorMessage = error instanceof Error ? error.message : String(error);
                     return { success: false, error: `Failed to create task: ${errorMessage}` };
                 }
@@ -1529,8 +1540,10 @@ export class BulletJournalMigration {
 
             // Handle skip marker - mark as [>] if [>-], otherwise mark as [s] for planning
             if (marker === 'skip') {
-                // If original marker was [>-], mark as [>], otherwise mark as [s]
-                if (originalMarker === '[>-]') {
+                // If original marker was [>-], mark as [>], otherwise mark as [s].
+                // originalMarker holds the whole matched prefix ("  - [>-]"),
+                // never the bare checkbox, so this has to be a substring test.
+                if (originalMarker.includes('[>-]')) {
                     const result = await this.markAsMigrated(taskLine, sourceFilePath);
                     return { success: result.success, sourceFile: sourceFilePath, destFile: null, skipped: true };
                 } else {
@@ -1545,18 +1558,18 @@ export class BulletJournalMigration {
                 return { success: result.success, sourceFile: sourceFilePath, destFile: null, skipped: true };
             }
 
-            const destination = this.calculateDestinationDate(marker, sourceDate, periodType as PeriodType);
+            const destination = this.calculateDestinationDate(marker, sourceDate, periodType);
             if (!destination) {
                 return { success: false, error: `Invalid destination marker: ${marker}` };
             }
-            console.log(`[BuJo] Planning migration destination calculated:`, { marker, sourceDate, periodType, destination });
+            log.debug(`Planning migration destination calculated:`, { marker, sourceDate, periodType, destination });
 
-            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType, destination.monthName);
-            console.log(`[BuJo] Target file path: ${targetFilePath}`);
+            const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
+            log.debug(`Target file path: ${targetFilePath}`);
 
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
-            console.log(`[BuJo] Task text: "${taskText}", cleaned: "${cleanTaskText}"`);
+            log.debug(`Task text: "${taskText}", cleaned: "${cleanTaskText}"`);
 
             // Preserve indentation from original line for nested tasks
             const indentMatch = taskLine.match(/^(\s*)/);
@@ -1572,17 +1585,17 @@ export class BulletJournalMigration {
                     !origMarker.startsWith('>') && !origMarker.startsWith('<') && !origMarker.startsWith('+>')) {
                     destMarker = `[${origMarker}]`;
                 } else {
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
                 } else {
-                    destMarker = this.getDestinationMarker(type as TaskType);
+                    destMarker = this.getDestinationMarker(type);
                 }
                 // For information points (type === '.'), destMarker is empty, so format is: - Information text
                 // For other types, format is: - [marker] text
                 const destTaskLine = type === '.'
                     ? `${indent}- ${cleanTaskText}`
                     : `${indent}- ${destMarker} ${cleanTaskText}`;
-            console.log(`[BuJo] Destination task line: ${destTaskLine}`);
+            log.debug(`Destination task line: ${destTaskLine}`);
 
             // Process child tasks - only incomplete children go to destination
             const destChildLines: string[] = [];
@@ -1591,7 +1604,7 @@ export class BulletJournalMigration {
             for (const child of childTasks) {
                 // Skip completed and cancelled children - they stay in source unchanged
                 if (this.isCompletedTask(child.line) || this.isDeletedTask(child.line)) {
-                    console.log(`[BuJo] Skipping completed/cancelled child: "${this.getTaskText(child.line)}"`);
+                    log.debug(`Skipping completed/cancelled child: "${this.getTaskText(child.line)}"`);
                     continue;
                 }
 
@@ -1635,17 +1648,17 @@ export class BulletJournalMigration {
 
             // Use [s] instead of [>] for planning - replace checkbox content
             const updatedSourceLine = taskLine.replace(/^(\s*-\s*)\[[^\]]+\]/, '$1[s]');
-            console.log(`[BuJo] Updated source line (scheduled): ${updatedSourceLine}`);
+            log.debug(`Updated source line (scheduled): ${updatedSourceLine}`);
 
             try {
                 await this.appendToFile(targetFilePath, allDestLines, destination.monthName || null);
                 if (destChildLines.length > 0) {
-                    console.log(`[BuJo] Successfully appended task with ${destChildLines.length} children to ${targetFilePath}`);
+                    log.debug(`Successfully appended task with ${destChildLines.length} children to ${targetFilePath}`);
                 } else {
-                    console.log(`[BuJo] Successfully appended task to ${targetFilePath}`);
+                    log.debug(`Successfully appended task to ${targetFilePath}`);
                 }
             } catch (error) {
-                console.error(`[BuJo] Failed to append task to ${targetFilePath}:`, error);
+                log.error(`Failed to append task to ${targetFilePath}:`, error);
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 return { success: false, error: `Failed to append to destination: ${errorMessage}` };
             }
@@ -1664,1795 +1677,88 @@ export class BulletJournalMigration {
                         } catch (childError) {
                             childUpdateErrors++;
                             const childTaskText = this.getTaskText(childUpdate.original);
-                            console.error(`[BuJo] Failed to update child task "${childTaskText.substring(0, 50)}" in ${sourceFilePath}:`, childError);
+                            log.error(`Failed to update child task "${childTaskText.substring(0, 50)}" in ${sourceFilePath}:`, childError);
                             // Continue processing other children instead of failing completely
                         }
                     }
 
                     const successfulChildUpdates = childUpdates.length - childUpdateErrors;
                     if (childUpdates.length > 0) {
-                        console.log(`[BuJo] Successfully updated source file ${sourceFilePath} with [s] marker (parent + ${successfulChildUpdates}/${childUpdates.length} children${childUpdateErrors > 0 ? `, ${childUpdateErrors} child updates failed` : ''})`);
+                        log.debug(`Successfully updated source file ${sourceFilePath} with [s] marker (parent + ${successfulChildUpdates}/${childUpdates.length} children${childUpdateErrors > 0 ? `, ${childUpdateErrors} child updates failed` : ''})`);
                     } else {
-                        console.log(`[BuJo] Successfully updated source file ${sourceFilePath} with [s] marker`);
+                        log.debug(`Successfully updated source file ${sourceFilePath} with [s] marker`);
                     }
                 } catch (error) {
-                    console.error(`[BuJo] Failed to update parent task in source file ${sourceFilePath}:`, error);
+                    log.error(`Failed to update parent task in source file ${sourceFilePath}:`, error);
                     const errorMessage = error instanceof Error ? error.message : String(error);
                     return { success: false, error: `Failed to update source: ${errorMessage}` };
                 }
             } else if (isNewTask) {
-                console.log(`[BuJo] Skipping source update for new task marker [+>`);
+                log.debug(`Skipping source update for new task marker [+>`);
             }
 
             return { success: true, sourceFile: sourceFilePath, destFile: targetFilePath, childrenMarked: childUpdates.length };
         } catch (error) {
-            console.error(`[BuJo] Planning migration error:`, error);
+            log.error(`Planning migration error:`, error);
             const errorMessage = error instanceof Error ? error.message : String(error);
             return { success: false, error: errorMessage };
         }
     }
 
     // =================================================================
-    // REVIEW COMMANDS
+    // COMMANDS
+    //
+    // Thin delegators. The implementations live in reviews.ts and
+    // task-commands.ts, which take this instance as their first argument;
+    // keeping the methods here means command IDs, call sites and `this.`
+    // recursion inside the engine all keep working unchanged.
     // =================================================================
 
-    /**
-     * Process Daily Note - Migrate tasks in current daily note
-     */
-    async migrateDailyNote(): Promise<void> {
-        try {
-            new Notice('Processing daily note...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice('Please open a daily note');
-                return;
-            }
-
-            // Check if it's a daily note
-            if (!activeFile.path.includes('Daily Notes')) {
-                new Notice('Please open a daily note from Journal/001 Daily Notes/');
-                return;
-            }
-
-            const sourceDate = this.getDateFromFilePath(activeFile.path);
-            if (!sourceDate) {
-                new Notice('Could not determine date from filename');
-                return;
-            }
-
-            const content = await this.app.vault.read(activeFile as TFile);
-            const lines = content.split('\n');
-
-            let migratedCount = 0;
-            let newTaskCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            const errors: string[] = [];
-
-            // Process each line
-            for (const line of lines) {
-                const trimmedLine = line.trim();
-                if (!this.isBulletItem(trimmedLine)) continue;
-
-                // Skip completed and cancelled tasks - they're already done, leave them as-is
-                if (this.isCompletedTask(trimmedLine)) {
-                    completedCount++;
-                    continue;
-                }
-                
-                if (this.isDeletedTask(trimmedLine)) {
-                    completedCount++; // Count as "done" (cancelled)
-                    continue;
-                }
-                
-                // Skip already processed new tasks [+]
-                if (/^-\s*\[\+\]/.test(trimmedLine)) {
-                    console.log(`[BuJo] Skipping already-created new task: "${trimmedLine.substring(0, 50)}"`);
-                    continue;
-                }
-
-                // Handle delete marker [d] - remove task entirely
-                const parsed = this.parseMigrationMarker(trimmedLine);
-                if (parsed && parsed.marker === 'delete') {
-                    try {
-                        const result = await this.deleteTask(line, activeFile.path);
-                        if (result.success) {
-                            deletedCount++;
-                            console.log(`[BuJo] Deleted task: "${this.getTaskText(trimmedLine)}"`);
-                        } else {
-                            errors.push(`Delete failed: ${result.error}`);
-                        }
-                    } catch (error) {
-                        const errorMessage = error instanceof Error ? error.message : String(error);
-                        errors.push(`Delete error: ${errorMessage}`);
-                    }
-                    continue;
-                }
-
-                // Check if this is a new task marker [+>
-                const isNewTaskMarker = parsed && parsed.isNewTask;
-
-                // Handle new tasks (don't require source path)
-                if (isNewTaskMarker && this.hasMigrationMarker(trimmedLine)) {
-                    console.log(`[BuJo] Creating new task: "${this.getTaskText(trimmedLine)}"`);
-                    const result = await this.createNewTask(line, sourceDate);
-                    if (result.success) {
-                        newTaskCount++;
-                        migratedCount++;
-                        console.log(`[BuJo] Successfully created new task in ${result.destFile}`);
-                        
-                        // Mark as created with [+] (similar to how migrations mark as [>])
-                        try {
-                            const taskText = this.getTaskText(line);
-                            const indent = line.match(/^(\s*)/)?.[0] || '';
-                            const updatedLine = `${indent}- [+] ${taskText}`;
-                            await this.updateTaskInFile(activeFile.path, line, updatedLine);
-                            console.log(`[BuJo] Marked new task as created [+] in source file`);
-                        } catch (updateError) {
-                            console.error(`[BuJo] Failed to mark new task as created:`, updateError);
-                            // Don't fail the whole operation if we can't mark it
-                        }
-                    } else {
-                        errors.push(`New task creation failed: ${result.error}`);
-                        console.error(`[BuJo] Failed to create new task: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                // Handle migration markers (works for tasks, events, information, etc.)
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    try {
-                        const result = await this.migrateTask(
-                            line,  // Pass original line with whitespace, not trimmed
-                            activeFile.path,
-                            sourceDate,
-                            'daily'
-                        );
-
-                        if (result.success && !result.skipped) {
-                            migratedCount++;
-                        } else if (result.success && result.skipped) {
-                            // Task was marked but not migrated (e.g., [<] or [>skip])
-                            console.log(`[BuJo] Task marked but not migrated: "${trimmedLine.substring(0, 50)}"`);
-                        } else {
-                            // Skip invalid markers silently (like [>->])
-                            if (result.error && result.error.includes('Unknown migration marker')) {
-                                console.log(`[BuJo] Skipping invalid marker in task: "${trimmedLine.substring(0, 50)}"`);
-                            } else {
-                                errors.push(`Migration failed: ${result.error}`);
-                            }
-                        }
-                    } catch (error) {
-                        // Skip invalid markers silently
-                        const errorMessage = error instanceof Error ? error.message : String(error);
-                        if (errorMessage.includes('Unknown migration marker')) {
-                            console.log(`[BuJo] Skipping invalid marker in task: "${trimmedLine.substring(0, 50)}"`);
-                        } else {
-                            errors.push(`Migration error: ${errorMessage}`);
-                        }
-                    }
-                }
-            }
-
-            const message = `Daily note processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}${deletedCount > 0 ? `, ${deletedCount} deleted` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Processing errors:', errors);
-                console.error('Error details:', errors.map((e, i) => `${i + 1}. ${e}`).join('\n'));
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Process daily note error:', error);
-        }
-    }
-
-    /**
-     * Generate Weekly Review
-     */
     async generateWeeklyReview(weekString: string | null = null): Promise<void> {
-        try {
-            new Notice('Generating weekly review...');
-
-            let targetWeek;
-            if (weekString) {
-                targetWeek = moment(weekString, 'YYYY-[W]WW');
-            } else {
-                // Try to detect from active file
-                const activeFile = this.app.workspace.getActiveFile();
-                if (activeFile && activeFile instanceof TFile) {
-                    const weekMatch = activeFile.path.match(/(\d{4})-W(\d{2})\.md$/);
-                    if (weekMatch && weekMatch[1] && weekMatch[2]) {
-                        const year = parseInt(weekMatch[1]);
-                        const week = parseInt(weekMatch[2]);
-                        targetWeek = moment().year(year).isoWeek(week);
-                    } else {
-                        // Default to previous week
-                        targetWeek = moment().subtract(1, 'week');
-                    }
-                } else {
-                    // Default to previous week
-                    targetWeek = moment().subtract(1, 'week');
-                }
-            }
-            const year = targetWeek.year();
-            const week = targetWeek.isoWeek();
-            const weekStr = `${year}-W${String(week).padStart(2, '0')}`;
-
-            const reviewPath = `Journal/Bujo Reviews/Weekly/${weekStr}-Review.md`;
-            const monday = targetWeek.startOf('isoWeek');
-            const tasks = [];
-
-            const tasksBySource: Record<string, string[]> = {};
-
-            for (let i = 0; i < 7; i++) {
-                const currentDay = monday.clone().add(i, 'days');
-                const dateStr = currentDay.format('YYYY-MM-DD');
-                const dailyPath = `Journal/001 Daily Notes/${dateStr}.md`;
-
-                const incompleteTasks = await this.getIncompleteTasks(dailyPath);
-
-                if (incompleteTasks.length > 0) {
-                    if (!tasksBySource[dailyPath]) {
-                        tasksBySource[dailyPath] = [];
-                    }
-                    tasksBySource[dailyPath].push(...incompleteTasks);
-                }
-            }
-
-            // Also check the weekly note itself for incomplete tasks
-            const weeklyPath = `Journal/002 Weekly Notes/${weekStr}.md`;
-            const weeklyTasks = await this.getIncompleteTasks(weeklyPath);
-            if (weeklyTasks.length > 0) {
-                tasksBySource[weeklyPath] = weeklyTasks;
-            }
-
-            const lines = [`# Weekly Review - ${weekStr}`, ''];
-
-            if (Object.keys(tasksBySource).length === 0) {
-                lines.push('No incomplete tasks found for this week.', '');
-            } else {
-                // Output tasks grouped by source path
-                Object.entries(tasksBySource).sort().forEach(([source, sourceTasks]) => {
-                    // Extract just the date/identifier from the path for cleaner headings
-                    // Daily: Journal/001 Daily Notes/2026-01-07.md → 2026-01-07
-                    // Weekly: Journal/002 Weekly Notes/2026-W02.md → 2026-W02
-                    // Monthly: Journal/003 Monthly Notes/2026-02.md → 2026-02
-                    const dateMatch = source.match(/(\d{4}-(?:W)?\d{2}(?:-\d{2})?)\.md$/);
-                    const heading = dateMatch ? `## [[${dateMatch[1]}]]` : `## [[${source}]]`;
-                    lines.push(heading);
-                    sourceTasks.forEach(task => lines.push(task));
-                    lines.push('');
-                });
-            }
-
-            lines.push('---');
-            lines.push('**Instructions:**');
-            lines.push('- Add migration markers in brackets: [>>], [>w], [>m], [>{day}], [>{month}], [>fut]');
-            lines.push('- Optionally specify item type: [>mon{o}] for event, [>fri{a}] for appointment');
-            lines.push('- Mark completed tasks as [x]');
-            lines.push('- Mark cancelled tasks as [-]');
-            lines.push('- Delete tasks entirely with [d] (removes from source file)');
-            lines.push('- Mark as migrated without migrating: [>skip] or [<] or [>-]');
-            lines.push('- Add new tasks with [+> marker: [+>w], [+>m], [+>tue], etc. (creates new task, doesn\'t look for source)');
-            lines.push('- Run "Process Weekly Review" when done');
-
-            const content = lines.join('\n');
-            const existingFile = this.app.vault.getAbstractFileByPath(reviewPath);
-
-            if (existingFile) {
-                await this.app.vault.modify(existingFile as TFile, content);
-            } else {
-                const folder = this.app.vault.getAbstractFileByPath('Journal/Bujo Reviews/Weekly');
-                if (!folder) await this.app.vault.createFolder('Journal/Bujo Reviews/Weekly');
-                await this.app.vault.create(reviewPath, content);
-            }
-
-            const file = this.app.vault.getAbstractFileByPath(reviewPath);
-            if (file) await this.app.workspace.getLeaf().openFile(file as TFile);
-
-            new Notice(`Weekly review created: ${reviewPath}`);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Weekly review error:', error);
-        }
+        return reviews.generateWeeklyReview(this, weekString);
     }
 
-    /**
-     * Process Weekly Review
-     */
     async migrateWeeklyReview(): Promise<void> {
-        try {
-            new Notice('Processing weekly review...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile || !activeFile.path.includes('Bujo Reviews/Weekly')) {
-                new Notice('Please open a weekly review note');
-                return;
-            }
-
-            const reviewPath = activeFile.path;
-            const reviewFile = this.app.vault.getAbstractFileByPath(reviewPath);
-            const content = await this.app.vault.read(reviewFile as TFile);
-            const lines = content.split('\n');
-
-            let migratedCount = 0;
-            let newTaskCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            const errors = [];
-            let currentSourcePath = null;
-            const processedLines = new Set(); // Track lines that have been processed as children
-
-            for (let i = 0; i < lines.length; i++) {
-                // Skip if this line was already processed as a child of a parent task
-                if (processedLines.has(i)) {
-                    continue;
-                }
-                
-                const line = lines[i];
-                if (!line) continue;
-                const trimmedLine = line.trim();
-                
-                // Parse headings for source path (## or ###)
-                const headingPath = tryParseHeadingPath(trimmedLine);
-                if (headingPath) {
-                    currentSourcePath = headingPath;
-                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
-                    continue;
-                }
-                
-                if (!this.isBulletItem(trimmedLine)) continue;
-
-                // Check if this is a new task marker [+>
-                const parsedMarker = this.parseMigrationMarker(trimmedLine);
-                const isNewTaskMarker = parsedMarker && parsedMarker.isNewTask;
-
-                // Try to extract source path from heading or use current
-                const previousLines = lines.slice(Math.max(0, i - 10), i);
-                const sourcePath = this.extractSourcePath(trimmedLine, previousLines) || currentSourcePath;
-                const isNewTask = !sourcePath || isNewTaskMarker;
-
-                // Handle new tasks (no source path or [+> marker)
-                if (isNewTask) {
-                    if (this.hasMigrationMarker(trimmedLine)) {
-                        // Try to get date from review file path
-                        let reviewDate = null;
-                        const weekMatch = reviewPath.match(/(\d{4})-W(\d{2})/);
-                        if (weekMatch && weekMatch[1] && weekMatch[2]) {
-                            reviewDate = moment().year(parseInt(weekMatch[1], 10)).isoWeek(parseInt(weekMatch[2], 10)).startOf('isoWeek').format('YYYY-MM-DD');
-                        } else {
-                            const monthMatch = reviewPath.match(/(\d{4}-\d{2})/);
-                            if (monthMatch && monthMatch[1]) {
-                                reviewDate = `${monthMatch[1]}-01`;
-                            }
-                        }
-
-                        // Use original line to preserve indentation for nested tasks
-                        const result = await this.createNewTask(line, reviewDate);
-                        if (result.success) {
-                            newTaskCount++;
-                            migratedCount++;
-                        } else {
-                            errors.push(`New task creation failed: ${result.error}`);
-                        }
-                    }
-                    continue;
-                }
-
-                // Handle existing tasks with source path
-                if (this.isCompletedTask(trimmedLine)) {
-                    const result = await this.completeTask(trimmedLine, sourcePath);
-                    if (result.success) {
-                        completedCount++;
-                    } else {
-                        errors.push(`Complete failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                if (this.isDeletedTask(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    console.log(`[BuJo] Processing cancelled task: "${taskText}" from ${sourcePath}`);
-                    // Use original line to preserve indentation
-                    const result = await this.cancelTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                    } else {
-                        const errorMsg = `Task "${taskText}": Cancel failed - ${result.error}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] Cancel failed for task: "${taskText}"`, result.error);
-                    }
-                    continue;
-                }
-
-                // Handle delete marker [d] - remove task entirely from source file
-                const deleteMarkerParsedWeekly = this.parseMigrationMarker(trimmedLine);
-                if (deleteMarkerParsedWeekly && deleteMarkerParsedWeekly.marker === 'delete') {
-                    console.log(`[BuJo] Processing [d] marker: "${this.getTaskText(trimmedLine)}" from source: ${sourcePath}`);
-                    if (!sourcePath) {
-                        console.error(`[BuJo] No source path found for [d] task: "${this.getTaskText(trimmedLine)}"`);
-                        errors.push(`Delete failed: No source path found for task "${this.getTaskText(trimmedLine)}"`);
-                        continue;
-                    }
-                    const result = await this.deleteTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                        console.log(`[BuJo] Successfully deleted task from ${sourcePath}: "${this.getTaskText(trimmedLine)}"`);
-                    } else {
-                        console.error(`[BuJo] Failed to delete task from ${sourcePath}: ${result.error}`);
-                        errors.push(`Delete failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    const sourceDate = this.getDateFromFilePath(sourcePath);
-                    const periodType = this.detectPeriodType(sourcePath);
-
-                    console.log(`[BuJo] Attempting to migrate task: "${taskText}" from ${sourcePath} (date: ${sourceDate}, period: ${periodType})`);
-
-                    if (!sourceDate) {
-                        const errorMsg = `Task "${taskText}": Could not determine date from: ${sourcePath}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] ${errorMsg}`);
-                        continue;
-                    }
-
-                    // Collect children from SOURCE file (not review file) to preserve actual parent-child relationships
-                    const childTasks = await this.collectChildrenFromSource(sourcePath, taskText);
-                    
-                    // Mark child lines in review as processed (if they exist) so we don't process them separately
-                    // But we'll use the children from the source file for migration
-                    if (childTasks.length > 0) {
-                        // Try to find matching children in review file and mark them as processed
-                        const parentIndent = this.getIndentLevel(line);
-                        const reviewChildren = this.collectChildTasks(lines, i, parentIndent);
-                        reviewChildren.forEach(child => processedLines.add(child.index));
-                    }
-                    
-                    // Use original line to preserve indentation for nested tasks
-                    // Migrate parent with children from source file
-                    const result = await this.migrateTask(line, sourcePath, sourceDate, periodType, childTasks);
-                    if (result.success && !result.skipped) {
-                        migratedCount++;
-                        if (childTasks.length > 0) {
-                            console.log(`[BuJo] Successfully migrated task with ${childTasks.length} children: "${taskText}" to ${result.destFile || 'marked as migrated'}`);
-                        } else {
-                            console.log(`[BuJo] Successfully migrated task: "${taskText}" to ${result.destFile || 'marked as migrated'}`);
-                        }
-                    } else if (result.success && result.skipped) {
-                        // Task was marked but not migrated (e.g., [<] or [>skip])
-                        console.log(`[BuJo] Task marked but not migrated: "${taskText}"`);
-                    } else {
-                        const errorMsg = `Task "${taskText}": Migration failed - ${result.error}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] Migration failed for task: "${taskText}" from ${sourcePath}`, result.error);
-                    }
-                }
-            }
-
-            await this.app.vault.delete(reviewFile as TFile);
-
-            const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Processing errors:', errors);
-                console.error('Full error details:', errors.map((e, i) => `${i + 1}. ${e}`).join('\n'));
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Process review error:', error);
-        }
+        return reviews.migrateWeeklyReview(this);
     }
 
-    /**
-     * Generate Monthly Review
-     */
     async generateMonthlyReview(monthString: string | null = null): Promise<void> {
-        try {
-            new Notice('Generating monthly review...');
-
-            let targetMonth;
-            if (monthString) {
-                targetMonth = moment(monthString, 'YYYY-MM');
-            } else {
-                // Try to detect from active file
-                const activeFile = this.app.workspace.getActiveFile();
-                if (activeFile && activeFile instanceof TFile) {
-                    const monthMatch = activeFile.path.match(/(\d{4}-\d{2})\.md$/);
-                    if (monthMatch) {
-                        targetMonth = moment(monthMatch[1], 'YYYY-MM');
-                    } else {
-                        // Default to previous month
-                        targetMonth = moment().subtract(1, 'month');
-                    }
-                } else {
-                    // Default to previous month
-                    targetMonth = moment().subtract(1, 'month');
-                }
-            }
-            const yearMonth = targetMonth.format('YYYY-MM');
-            const reviewPath = `Journal/Bujo Reviews/Monthly/${yearMonth}-Review.md`;
-
-            const firstDay = targetMonth.startOf('month');
-            const lastDay = targetMonth.clone().endOf('month');
-
-            const tasksBySource: Record<string, string[]> = {};
-
-            let currentDay = firstDay.clone();
-            while (currentDay.isSameOrBefore(lastDay, 'day')) {
-                const dateStr = currentDay.format('YYYY-MM-DD');
-                const dailyPath = `Journal/001 Daily Notes/${dateStr}.md`;
-
-                const incompleteTasks = await this.getIncompleteTasks(dailyPath);
-
-                if (incompleteTasks.length > 0) {
-                    if (!tasksBySource[dailyPath]) {
-                        tasksBySource[dailyPath] = [];
-                    }
-                    tasksBySource[dailyPath].push(...incompleteTasks);
-                }
-
-                currentDay.add(1, 'day');
-            }
-
-            let weekNum = firstDay.isoWeek();
-            const lastWeekNum = lastDay.isoWeek();
-            while (weekNum <= lastWeekNum) {
-                const weekStr = `${firstDay.year()}-W${String(weekNum).padStart(2, '0')}`;
-                const weeklyPath = `Journal/002 Weekly Notes/${weekStr}.md`;
-                const incompleteTasks = await this.getIncompleteTasks(weeklyPath);
-
-                if (incompleteTasks.length > 0) {
-                    if (!tasksBySource[weeklyPath]) {
-                        tasksBySource[weeklyPath] = [];
-                    }
-                    tasksBySource[weeklyPath].push(...incompleteTasks);
-                }
-                weekNum++;
-            }
-
-            // Also check the monthly note itself for incomplete tasks
-            const monthlyPath = `Journal/003 Monthly Notes/${yearMonth}.md`;
-            const monthlyTasks = await this.getIncompleteTasks(monthlyPath);
-            if (monthlyTasks.length > 0) {
-                tasksBySource[monthlyPath] = monthlyTasks;
-            }
-
-            const lines = [`# Monthly Review - ${yearMonth}`, ''];
-
-            if (Object.keys(tasksBySource).length === 0) {
-                lines.push('No incomplete tasks found for this month.', '');
-            } else {
-                // Output tasks grouped by source path
-                Object.entries(tasksBySource).sort().forEach(([source, sourceTasks]) => {
-                    // Extract just the date/identifier from the path for cleaner headings
-                    // Daily: Journal/001 Daily Notes/2026-01-07.md → 2026-01-07
-                    // Weekly: Journal/002 Weekly Notes/2026-W02.md → 2026-W02
-                    // Monthly: Journal/003 Monthly Notes/2026-02.md → 2026-02
-                    const dateMatch = source.match(/(\d{4}-(?:W)?\d{2}(?:-\d{2})?)\.md$/);
-                    const heading = dateMatch ? `## [[${dateMatch[1]}]]` : `## [[${source}]]`;
-                    lines.push(heading);
-                    sourceTasks.forEach(task => lines.push(task));
-                        lines.push('');
-                });
-            }
-
-            lines.push('---');
-            lines.push('**Instructions:**');
-            lines.push('- Add migration markers in brackets: [>>], [>w], [>m], [>{day}], [>{month}], [>fut]');
-            lines.push('- Optionally specify item type: [>marker{o}] for event, [>marker{a}] for appointment');
-            lines.push('- Mark completed tasks as [x]');
-            lines.push('- Mark cancelled tasks as [-]');
-            lines.push('- Delete tasks entirely with [d] (removes from source file)');
-            lines.push('- Mark as migrated without migrating: [>skip] or [<] or [>-]');
-            lines.push('- Add new tasks with [+> marker: [+>w], [+>m], [+>tue], etc. (creates new task, doesn\'t look for source)');
-            lines.push('- Run "Process Monthly Review" when done');
-
-            const content = lines.join('\n');
-            const existingFile = this.app.vault.getAbstractFileByPath(reviewPath);
-
-            if (existingFile) {
-                await this.app.vault.modify(existingFile as TFile, content);
-            } else {
-                const folder = this.app.vault.getAbstractFileByPath('Journal/Bujo Reviews/Monthly');
-                if (!folder) await this.app.vault.createFolder('Journal/Bujo Reviews/Monthly');
-                await this.app.vault.create(reviewPath, content);
-            }
-
-            const file = this.app.vault.getAbstractFileByPath(reviewPath);
-            if (file) await this.app.workspace.getLeaf().openFile(file as TFile);
-
-            new Notice(`Monthly review created: ${reviewPath}`);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Monthly review error:', error);
-        }
+        return reviews.generateMonthlyReview(this, monthString);
     }
 
-    /**
-     * Process Monthly Review
-     */
     async migrateMonthlyReview(): Promise<void> {
-        try {
-            new Notice('Processing monthly review...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile || !activeFile.path.includes('Bujo Reviews/Monthly')) {
-                new Notice('Please open a monthly review note');
-                return;
-            }
-
-            const reviewPath = activeFile.path;
-            const reviewFile = this.app.vault.getAbstractFileByPath(reviewPath);
-            const content = await this.app.vault.read(reviewFile as TFile);
-            const lines = content.split('\n');
-
-            let migratedCount = 0;
-            let newTaskCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            const errors = [];
-            let currentSourcePath = null;
-            const processedLines = new Set(); // Track lines that have been processed as children
-
-            for (let i = 0; i < lines.length; i++) {
-                // Skip if this line was already processed as a child of a parent task
-                if (processedLines.has(i)) {
-                    continue;
-                }
-
-                const line = lines[i];
-                if (!line) continue;
-                const trimmedLine = line.trim();
-
-                const headingPath = tryParseHeadingPath(trimmedLine);
-                if (headingPath) {
-                    currentSourcePath = headingPath;
-                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
-                    continue;
-                }
-
-
-                // Check for ## heading (section headers) - skip these
-                if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
-                    continue;
-                }
-
-                if (!this.isBulletItem(trimmedLine)) continue;
-
-                // Check if this is a new task marker [+>
-                const parsedMarker = this.parseMigrationMarker(trimmedLine);
-                const isNewTaskMarker = parsedMarker && parsedMarker.isNewTask;
-
-                // Try to extract source path from heading or use current
-                const previousLines = lines.slice(Math.max(0, i - 10), i);
-                const sourcePath = this.extractSourcePath(trimmedLine, previousLines) || currentSourcePath;
-                const isNewTask = !sourcePath || isNewTaskMarker;
-
-                // Handle new tasks (no source path or [+> marker)
-                if (isNewTask) {
-                    if (this.hasMigrationMarker(trimmedLine)) {
-                        // Try to get date from review file path
-                        let reviewDate = null;
-                        const monthMatch = reviewPath.match(/(\d{4}-\d{2})/);
-                        if (monthMatch) {
-                            reviewDate = `${monthMatch[1]}-01`;
-                        }
-
-                        // Use original line to preserve indentation for nested tasks
-                        const result = await this.createNewTask(line, reviewDate);
-                        if (result.success) {
-                            newTaskCount++;
-                            migratedCount++;
-                        } else {
-                            errors.push(`New task creation failed: ${result.error}`);
-                        }
-                    }
-                    continue;
-                }
-
-                // Handle existing tasks with source path
-                if (this.isCompletedTask(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    console.log(`[BuJo] Processing completed task: "${taskText}" from ${sourcePath}`);
-                    // Use original line to preserve indentation
-                    const result = await this.completeTask(line, sourcePath);
-                    if (result.success) {
-                        completedCount++;
-                    } else {
-                        const errorMsg = `Task "${taskText}": Complete failed - ${result.error}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] Complete failed for task: "${taskText}"`, result.error);
-                    }
-                    continue;
-                }
-
-                if (this.isDeletedTask(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    console.log(`[BuJo] Processing cancelled task: "${taskText}" from ${sourcePath}`);
-                    // Use original line to preserve indentation
-                    const result = await this.cancelTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                    } else {
-                        const errorMsg = `Task "${taskText}": Cancel failed - ${result.error}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] Cancel failed for task: "${taskText}"`, result.error);
-                    }
-                    continue;
-                }
-
-                // Handle delete marker [d] - remove task entirely from source file
-                const deleteMarkerParsedMonthly = this.parseMigrationMarker(trimmedLine);
-                if (deleteMarkerParsedMonthly && deleteMarkerParsedMonthly.marker === 'delete') {
-                    const result = await this.deleteTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                        console.log(`[BuJo] Deleted task from ${sourcePath}: "${this.getTaskText(trimmedLine)}"`);
-                    } else {
-                        errors.push(`Delete failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    const sourceDate = this.getDateFromFilePath(sourcePath);
-                    const periodType = this.detectPeriodType(sourcePath);
-
-                    console.log(`[BuJo] Attempting to migrate task: "${taskText}" from ${sourcePath} (date: ${sourceDate}, period: ${periodType})`);
-
-                    if (!sourceDate) {
-                        const errorMsg = `Task "${taskText}": Could not determine date from: ${sourcePath}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] ${errorMsg}`);
-                        continue;
-                    }
-
-                    // Collect children from SOURCE file (not review file) to preserve actual parent-child relationships
-                    const childTasks = await this.collectChildrenFromSource(sourcePath, taskText);
-                    
-                    // Mark child lines in review as processed (if they exist) so we don't process them separately
-                    // But we'll use the children from the source file for migration
-                    if (childTasks.length > 0) {
-                        // Try to find matching children in review file and mark them as processed
-                        const parentIndent = this.getIndentLevel(line);
-                        const reviewChildren = this.collectChildTasks(lines, i, parentIndent);
-                        reviewChildren.forEach(child => processedLines.add(child.index));
-                    }
-                    
-                    // Use original line to preserve indentation for nested tasks
-                    // Migrate parent with children from source file
-                    const result = await this.migrateTask(line, sourcePath, sourceDate, periodType, childTasks);
-                    if (result.success && !result.skipped) {
-                        migratedCount++;
-                        if (childTasks.length > 0) {
-                            console.log(`[BuJo] Successfully migrated task with ${childTasks.length} children: "${taskText}" to ${result.destFile || 'marked as migrated'}`);
-                        } else {
-                            console.log(`[BuJo] Successfully migrated task: "${taskText}" to ${result.destFile || 'marked as migrated'}`);
-                        }
-                    } else if (result.success && result.skipped) {
-                        // Task was marked but not migrated (e.g., [<] or [>skip])
-                        console.log(`[BuJo] Task marked but not migrated: "${taskText}"`);
-                    } else {
-                        const errorMsg = `Task "${taskText}": Migration failed - ${result.error}`;
-                        errors.push(errorMsg);
-                        console.error(`[BuJo] Migration failed for task: "${taskText}" from ${sourcePath}`, result.error);
-                    }
-                }
-            }
-
-            await this.app.vault.delete(reviewFile as TFile);
-
-            const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Processing errors:', errors);
-                console.error('Full error details:', errors.map((e, i) => `${i + 1}. ${e}`).join('\n'));
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Process monthly review error:', error);
-        }
+        return reviews.migrateMonthlyReview(this);
     }
 
-    /**
-     * Process Weekly Plan - Process tasks directly in weekly note (marks as [s] instead of [>])
-     */
-    /**
-     * Schedule Plan - Process tasks in weekly/monthly notes (marks as [s] instead of [>])
-     * Unified method that handles both weekly and monthly planning
-     */
-    async schedulePlan(periodType: PeriodType): Promise<void> {
-        const periodNames: Record<string, string> = {
-            weekly: 'weekly',
-            monthly: 'monthly'
-        };
-        const periodName = periodNames[periodType] || periodType;
-
-        try {
-            new Notice(`Processing ${periodName} plan...`);
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice(`Please open a ${periodName} note`);
-                return;
-            }
-
-            const filePath = activeFile.path;
-            const file = this.app.vault.getAbstractFileByPath(filePath);
-            const content = await this.app.vault.read(file as TFile);
-            const lines = content.split('\n');
-
-            let scheduledCount = 0;
-            let newTaskCount = 0;
-            const errors: string[] = [];
-
-            // Extract date from file path based on period type
-            let sourceDate: string | null = null;
-            if (periodType === 'weekly') {
-                const weekMatch = filePath.match(/(\d{4})-W(\d{2})/);
-                if (weekMatch && weekMatch[1] && weekMatch[2]) {
-                    sourceDate = moment().year(parseInt(weekMatch[1], 10)).isoWeek(parseInt(weekMatch[2], 10)).startOf('isoWeek').format('YYYY-MM-DD');
-                }
-            } else if (periodType === 'monthly') {
-                const monthMatch = filePath.match(/(\d{4}-\d{2})\.md$/);
-                if (monthMatch) {
-                    sourceDate = `${monthMatch[1]}-01`;
-                }
-            }
-
-            if (!sourceDate) {
-                new Notice(`Could not determine date from file path`);
-                return;
-            }
-
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line) continue;
-                const trimmedLine = line.trim();
-
-                if (!trimmedLine.startsWith('- [')) continue;
-
-                // Skip completed and deleted tasks
-                if (this.isCompletedTask(trimmedLine) || this.isDeletedTask(trimmedLine)) {
-                    continue;
-                }
-
-                // Check if this is a new task marker [+>
-                const parsedMarker = this.parseMigrationMarker(trimmedLine);
-                const isNewTaskMarker = parsedMarker && parsedMarker.isNewTask;
-
-                // Handle new tasks
-                if (isNewTaskMarker) {
-                    if (this.hasMigrationMarker(trimmedLine)) {
-                        const result = await this.createNewTask(line, sourceDate);
-                        if (result.success) {
-                            newTaskCount++;
-                            scheduledCount++;
-                        } else {
-                            errors.push(`New task creation failed: ${result.error}`);
-                        }
-                    }
-                    continue;
-                }
-
-                // Skip tasks already marked as migrated/scheduled/created
-                if (trimmedLine.includes('[>-]') || trimmedLine.includes('[<]') || trimmedLine.includes('[s]') || trimmedLine.includes('[+]') || /\[>\]/.test(trimmedLine)) {
-                    continue;
-                }
-
-                // Handle migration markers
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    const taskText = this.getTaskText(trimmedLine);
-                    console.log(`[BuJo] Scheduling task: "${taskText}" from ${filePath}`);
-
-                    const result = await this.migrateTaskForPlan(line, filePath, sourceDate, periodType);
-                    if (result.success) {
-                        scheduledCount++;
-                        console.log(`[BuJo] Successfully scheduled task: "${taskText}" to ${result.destFile || 'marked as scheduled'}`);
-                    } else {
-                        errors.push(`Task "${taskText}": ${result.error}`);
-                        console.error(`[BuJo] Scheduling failed: "${taskText}"`, result.error);
-                    }
-                }
-            }
-
-            const periodLabel = periodName.charAt(0).toUpperCase() + periodName.slice(1);
-            const message = `${periodLabel} plan processed!\n✓ ${scheduledCount} tasks scheduled${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Scheduling errors:', errors);
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error(`Schedule ${periodName} plan error:`, error);
-        }
-    }
-
-    /**
-     * Generate Global Review - All incomplete tasks from ALL journal notes
-     */
     async generateGlobalReview(): Promise<void> {
-        try {
-            new Notice('Generating global review...');
-
-            const reviewPath = `Journal/Bujo Reviews/Global/Global-Review-${moment().format('YYYY-MM-DD-HHmm')}.md`;
-            const allTasks = [];
-
-            // Get all files in Journal folder
-            const allFiles = this.app.vault.getFiles();
-            const today = moment().startOf('day');
-            
-            const journalFiles = allFiles.filter(file => {
-                if (file.path.startsWith('Journal/001 Daily Notes/')) {
-                    // Check if daily note date is before today
-                    const dateMatch = file.path.match(/(\d{4}-\d{2}-\d{2})\.md$/);
-                    if (dateMatch) {
-                        const fileDate = moment(dateMatch[1], 'YYYY-MM-DD');
-                        return fileDate.isBefore(today);
-                    }
-                    return false;
-                } else if (file.path.startsWith('Journal/002 Weekly Notes/')) {
-                    // Check if weekly note is before current week
-                    const weekMatch = file.path.match(/(\d{4})-W(\d{2})\.md$/);
-                    if (weekMatch && weekMatch[1] && weekMatch[2]) {
-                        const fileWeek = moment().year(parseInt(weekMatch[1], 10)).isoWeek(parseInt(weekMatch[2], 10)).startOf('isoWeek');
-                        const currentWeek = moment().startOf('isoWeek');
-                        return fileWeek.isBefore(currentWeek);
-                    }
-                    return false;
-                } else if (file.path.startsWith('Journal/003 Monthly Notes/')) {
-                    // Check if monthly note is before current month
-                    const monthMatch = file.path.match(/(\d{4}-\d{2})\.md$/);
-                    if (monthMatch) {
-                        const fileMonth = moment(monthMatch[1], 'YYYY-MM').startOf('month');
-                        const currentMonth = moment().startOf('month');
-                        return fileMonth.isBefore(currentMonth);
-                    }
-                    return false;
-                }
-                return false;
-            });
-
-            // Sort files by path
-            journalFiles.sort((a, b) => a.path.localeCompare(b.path));
-
-            for (const file of journalFiles) {
-                const incompleteTasks = await this.getIncompleteTasks(file.path);
-
-                if (incompleteTasks.length > 0) {
-                    let section = '';
-                    if (file.path.includes('Daily Notes')) {
-                        section = 'Daily Notes';
-                    } else if (file.path.includes('Weekly Notes')) {
-                        section = 'Weekly Notes';
-                    } else if (file.path.includes('Monthly Notes')) {
-                        section = 'Monthly Notes';
-                    }
-
-                    allTasks.push({
-                        section,
-                        filename: file.basename,
-                        path: file.path,
-                        tasks: incompleteTasks,
-                    });
-                }
-            }
-
-            const lines = [`# Global Review - ${moment().format('YYYY-MM-DD HH:mm')}`, ''];
-
-            if (allTasks.length === 0) {
-                lines.push('No incomplete tasks found in journal.');
-                lines.push('');
-            } else {
-                // Group by section
-                type TaskItem = { section: string; path: string; tasks: string[] };
-                const sections: { [key: string]: TaskItem[] } = { 'Daily Notes': [], 'Weekly Notes': [], 'Monthly Notes': [] };
-                allTasks.forEach((item: TaskItem) => {
-                    if (!sections[item.section]) {
-                        sections[item.section] = [];
-                    }
-                    sections[item.section]!.push(item);
-                });
-
-                // Output by section
-                for (const [sectionName, items] of Object.entries(sections)) {
-                    if (items.length > 0) {
-                        lines.push(`## ${sectionName}`);
-                        lines.push('');
-
-                        items.forEach((item: TaskItem) => {
-                            // Extract just the date/identifier from the path for cleaner headings
-                            // Daily: Journal/001 Daily Notes/2026-01-07.md → 2026-01-07
-                            // Weekly: Journal/002 Weekly Notes/2026-W02.md → 2026-W02
-                            // Monthly: Journal/003 Monthly Notes/2026-02.md → 2026-02
-                            const dateMatch = item.path.match(/(\d{4}-(?:W)?\d{2}(?:-\d{2})?)\.md$/);
-                            const heading = dateMatch ? `### [[${dateMatch[1]}]]` : `### [[${item.path}]]`;
-                            lines.push(heading);
-                            item.tasks.forEach((task: string) => {
-                                lines.push(task);
-                            });
-                            lines.push('');
-                        });
-                    }
-                }
-
-                lines.push(`---`);
-                lines.push(`**Total: ${allTasks.reduce((sum, item) => sum + item.tasks.length, 0)} incomplete tasks**`);
-                lines.push('');
-            }
-
-            lines.push('---');
-            lines.push('**Instructions:**');
-            lines.push('- Add migration markers in brackets: [>>], [>w], [>m], [>{day}], [>{month}], [>fut]');
-            lines.push('- Optionally specify item type: [>mon{o}] for event, [>fri{a}] for appointment');
-            lines.push('- Mark completed tasks as [x]');
-            lines.push('- Mark cancelled tasks as [-]');
-            lines.push('- Delete tasks entirely with [d] (removes from source file)');
-            lines.push('- Mark as migrated without migrating: [>skip] or [<] or [>-]');
-            lines.push('- Add new tasks with [+> marker: [+>w], [+>m], [+>tue], etc. (creates new task, doesn\'t look for source)');
-            lines.push('- Run "Process Global Review" when done');
-
-            const content = lines.join('\n');
-
-            // Ensure directory exists
-            const folder = this.app.vault.getAbstractFileByPath('Journal/Bujo Reviews/Global');
-            if (!folder) await this.app.vault.createFolder('Journal/Bujo Reviews/Global');
-
-            await this.app.vault.create(reviewPath, content);
-
-            const file = this.app.vault.getAbstractFileByPath(reviewPath);
-            if (file) await this.app.workspace.getLeaf().openFile(file as TFile);
-
-            new Notice(`Global review created: ${reviewPath}`);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Global review error:', error);
-        }
+        return reviews.generateGlobalReview(this);
     }
 
-    /**
-     * Process Global Review
-     */
     async migrateGlobalReview(): Promise<void> {
-        try {
-            new Notice('Processing global review...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile || !activeFile.path.includes('Bujo Reviews/Global')) {
-                new Notice('Please open a global review note');
-                return;
-            }
-
-            const reviewPath = activeFile.path;
-            const reviewFile = this.app.vault.getAbstractFileByPath(reviewPath);
-            const content = await this.app.vault.read(reviewFile as TFile);
-            const lines = content.split('\n');
-
-            let migratedCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            let newTaskCount = 0;
-            const errors = [];
-            let currentSourcePath = null;
-
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line) continue;
-                const trimmedLine = line.trim();
-
-                const headingPath = tryParseHeadingPath(trimmedLine);
-                if (headingPath) {
-                    currentSourcePath = headingPath;
-                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
-                    continue;
-                }
-
-
-                // Check for ## heading (section headers like "Daily Notes", "Weekly Notes")
-                if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('###')) {
-                    // Section headers don't set source path, individual ### headings do
-                    continue;
-                }
-                
-                if (!this.isBulletItem(trimmedLine)) continue;
-
-                // Check if this is a new task marker [+>
-                const parsedMarker = this.parseMigrationMarker(trimmedLine);
-                const isNewTaskMarker = parsedMarker && parsedMarker.isNewTask;
-
-                // Try to extract source path from heading or use current
-                const previousLines = lines.slice(Math.max(0, i - 10), i);
-                const sourcePath = this.extractSourcePath(trimmedLine, previousLines) || currentSourcePath;
-                const isNewTask = !sourcePath || isNewTaskMarker;
-
-                // Handle new tasks (no source path or [+> marker)
-                if (isNewTask) {
-                    if (this.hasMigrationMarker(trimmedLine)) {
-                        // For global reviews, use current date as reference
-                        const reviewDate = moment().format('YYYY-MM-DD');
-                        // Use original line to preserve indentation for nested tasks
-                        const result = await this.createNewTask(line, reviewDate);
-                        if (result.success) {
-                            newTaskCount++;
-                            migratedCount++;
-                        } else {
-                            errors.push(`New task creation failed: ${result.error}`);
-                        }
-                    }
-                    continue;
-                }
-
-                // Handle existing tasks with source path
-                if (this.isCompletedTask(trimmedLine)) {
-                    // Use original line to preserve indentation
-                    const result = await this.completeTask(line, sourcePath);
-                    if (result.success) {
-                        completedCount++;
-                    } else {
-                        errors.push(`Complete failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                if (this.isDeletedTask(trimmedLine)) {
-                    // Use original line to preserve indentation
-                    const result = await this.cancelTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                    } else {
-                        errors.push(`Cancel failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                // Handle delete marker [d] - remove task entirely from source file
-                const deleteMarkerParsed = this.parseMigrationMarker(trimmedLine);
-                if (deleteMarkerParsed && deleteMarkerParsed.marker === 'delete') {
-                    console.log(`[BuJo] Processing [d] marker: "${this.getTaskText(trimmedLine)}" from source: ${sourcePath}`);
-                    if (!sourcePath) {
-                        console.error(`[BuJo] No source path found for [d] task: "${this.getTaskText(trimmedLine)}"`);
-                        errors.push(`Delete failed: No source path found for task "${this.getTaskText(trimmedLine)}"`);
-                        continue;
-                    }
-                    const result = await this.deleteTask(line, sourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                        console.log(`[BuJo] Successfully deleted task from ${sourcePath}: "${this.getTaskText(trimmedLine)}"`);
-                    } else {
-                        console.error(`[BuJo] Failed to delete task from ${sourcePath}: ${result.error}`);
-                        errors.push(`Delete failed: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    const sourceDate = this.getDateFromFilePath(sourcePath);
-                    const periodType = this.detectPeriodType(sourcePath);
-
-                    if (!sourceDate) {
-                        errors.push(`Could not determine date from: ${sourcePath}`);
-                        continue;
-                    }
-
-                    // Collect children from SOURCE file to preserve actual parent-child relationships
-                    const taskText = this.getTaskText(trimmedLine);
-                    const childTasks = await this.collectChildrenFromSource(sourcePath, taskText);
-
-                    // Use original line to preserve indentation for nested tasks
-                    const result = await this.migrateTask(line, sourcePath, sourceDate, periodType, childTasks);
-                    if (result.success && !result.skipped) {
-                        migratedCount++;
-                        if (childTasks.length > 0) {
-                            console.log(`[BuJo] Successfully migrated task with ${childTasks.length} children: "${taskText}"`);
-                        }
-                    } else if (result.success && result.skipped) {
-                        // Task was marked but not migrated (e.g., [<] or [>skip])
-                        console.log(`[BuJo] Task marked but not migrated: "${taskText}"`);
-                    } else {
-                        errors.push(`Migration failed: ${result.error}`);
-                    }
-                }
-            }
-
-            await this.app.vault.delete(reviewFile as TFile);
-
-            const message = `Global review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) console.error('Processing errors:', errors);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Process global review error:', error);
-        }
+        return reviews.migrateGlobalReview(this);
     }
 
-    /**
-     * Process Selected Tasks
-     * Processes only the selected text in the current note
-     * Updates the note as tasks are processed
-     * Continues even if individual tasks fail
-     */
+    async schedulePlan(periodType: PeriodType): Promise<void> {
+        return taskCommands.schedulePlan(this, periodType);
+    }
+
     async migrateSelectedTasks(editor: Editor): Promise<void> {
-        try {
-            new Notice('Processing selected tasks...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice('No active file');
-                return;
-            }
-
-            const selection = editor.getSelection();
-            if (!selection || selection.trim() === '') {
-                new Notice('Please select tasks to process');
-                return;
-            }
-
-            // Get the full content to find line numbers
-            const fullContent = editor.getValue();
-            const fullLines = fullContent.split('\n');
-
-            // Get selection position
-            const selectionStart = editor.getCursor('from');
-            const selectionEnd = editor.getCursor('to');
-
-            const selectedLines = selection.split('\n');
-            let migratedCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            let newTaskCount = 0;
-            const errors: string[] = [];
-            let currentSourcePath: string | null = null;
-            const linesToKeep: string[] = []; // Track which lines to keep in the review
-
-            // Process each selected line
-            for (let i = 0; i < selectedLines.length; i++) {
-                const line = selectedLines[i];
-                if (!line) {
-                    linesToKeep.push(''); // Keep empty lines
-                    continue;
-                }
-                const trimmedLine = line.trim();
-
-                // Parse headings for source path (## or ###)
-                const headingPath = tryParseHeadingPath(trimmedLine);
-                if (headingPath) {
-                    currentSourcePath = headingPath;
-                    console.log(`[BuJo] Set source path: ${currentSourcePath}`);
-                    linesToKeep.push(line); // Keep headings
-                    continue;
-                }
-
-                if (!this.isBulletItem(trimmedLine)) {
-                    linesToKeep.push(line); // Keep non-task lines
-                    continue;
-                }
-
-                // Check if this is a new task marker
-                const parsedMarker = this.parseMigrationMarker(trimmedLine);
-                const isNewTaskMarker = parsedMarker && parsedMarker.isNewTask;
-                const isNewTask = !currentSourcePath || isNewTaskMarker;
-
-                // Handle new tasks
-                if (isNewTask) {
-                    if (this.hasMigrationMarker(trimmedLine)) {
-                        const reviewDate = moment().format('YYYY-MM-DD');
-                        const result = await this.createNewTask(line, reviewDate);
-                        if (result.success) {
-                            newTaskCount++;
-                            migratedCount++;
-                            // Don't add to linesToKeep - remove from review
-                        } else {
-                            errors.push(`New task failed: ${result.error}`);
-                            linesToKeep.push(line); // Keep failed tasks
-                        }
-                    } else {
-                        linesToKeep.push(line); // Keep tasks without markers
-                    }
-                    continue;
-                }
-
-                // Handle existing tasks with source path
-                if (this.isCompletedTask(trimmedLine)) {
-                    if (!currentSourcePath) {
-                        errors.push(`Complete failed: No source path for "${this.getTaskText(trimmedLine)}"`);
-                        linesToKeep.push(line);
-                        continue;
-                    }
-                    const result = await this.completeTask(line, currentSourcePath);
-                    if (result.success) {
-                        completedCount++;
-                        // Don't add to linesToKeep - remove from review
-                    } else {
-                        errors.push(`Complete failed: ${result.error}`);
-                        linesToKeep.push(line); // Keep failed tasks
-                    }
-                    continue;
-                }
-
-                if (this.isDeletedTask(trimmedLine)) {
-                    if (!currentSourcePath) {
-                        errors.push(`Cancel failed: No source path for "${this.getTaskText(trimmedLine)}"`);
-                        linesToKeep.push(line);
-                        continue;
-                    }
-                    const result = await this.cancelTask(line, currentSourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                        // Don't add to linesToKeep - remove from review
-                    } else {
-                        errors.push(`Cancel failed: ${result.error}`);
-                        linesToKeep.push(line); // Keep failed tasks
-                    }
-                    continue;
-                }
-
-                // Handle delete marker [d]
-                const deleteMarkerParsed = this.parseMigrationMarker(trimmedLine);
-                if (deleteMarkerParsed && deleteMarkerParsed.marker === 'delete') {
-                    console.log(`[BuJo] Processing [d] marker: "${this.getTaskText(trimmedLine)}" from source: ${currentSourcePath}`);
-                    if (!currentSourcePath) {
-                        console.error(`[BuJo] No source path found for [d] task: "${this.getTaskText(trimmedLine)}"`);
-                        errors.push(`Delete failed: No source path for "${this.getTaskText(trimmedLine)}"`);
-                        linesToKeep.push(line);
-                        continue;
-                    }
-                    const result = await this.deleteTask(line, currentSourcePath);
-                    if (result.success) {
-                        deletedCount++;
-                        console.log(`[BuJo] Successfully deleted task from ${currentSourcePath}`);
-                        // Don't add to linesToKeep - remove from review
-                    } else {
-                        console.error(`[BuJo] Failed to delete task: ${result.error}`);
-                        errors.push(`Delete failed: ${result.error}`);
-                        linesToKeep.push(line); // Keep failed tasks
-                    }
-                    continue;
-                }
-
-                // Handle migration markers
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    if (!currentSourcePath) {
-                        errors.push(`Migration failed: No source path for "${this.getTaskText(trimmedLine)}"`);
-                        linesToKeep.push(line);
-                        continue;
-                    }
-
-                    const sourceDate = this.getDateFromFilePath(currentSourcePath);
-                    const periodType = this.detectPeriodType(currentSourcePath);
-
-                    if (!sourceDate) {
-                        errors.push(`Could not determine date from: ${currentSourcePath}`);
-                        linesToKeep.push(line);
-                        continue;
-                    }
-
-                    const result = await this.migrateTask(line, currentSourcePath, sourceDate, periodType);
-                    if (result.success && !result.skipped) {
-                        migratedCount++;
-                        // Don't add to linesToKeep - remove from review
-                    } else if (result.success && result.skipped) {
-                        console.log(`[BuJo] Task marked but not migrated: "${this.getTaskText(trimmedLine)}"`);
-                        // Don't add to linesToKeep - remove from review (task was marked)
-                    } else {
-                        errors.push(`Migration failed: ${result.error}`);
-                        linesToKeep.push(line); // Keep failed tasks
-                    }
-                    continue;
-                }
-
-                // If we get here, it's a task without a migration marker - keep it
-                linesToKeep.push(line);
-            }
-
-            // Update the editor to remove successfully processed tasks
-            const updatedSelection = linesToKeep.join('\n');
-            editor.replaceSelection(updatedSelection);
-
-            const message = `Selected tasks processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Processing errors:', errors);
-                console.error('Error details:', errors.map((e, i) => `${i + 1}. ${e}`).join('\n'));
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Process selected tasks error:', error);
-        }
+        return taskCommands.migrateSelectedTasks(this, editor);
     }
 
-    /**
-     * Schedule Selected Tasks - Schedule only the selected tasks to their destination dates
-     * Used for planning workflows - marks tasks as scheduled [<]
-     */
     async scheduleSelectedTasks(editor: Editor): Promise<void> {
-        try {
-            new Notice('Scheduling selected tasks...');
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice('No active file');
-                return;
-            }
-
-            const selection = editor.getSelection();
-            if (!selection || selection.trim() === '') {
-                new Notice('Please select tasks to schedule');
-                return;
-            }
-
-            const selectedLines = selection.split('\n');
-            let scheduledCount = 0;
-            const errors: string[] = [];
-            const updatedLines: string[] = [];
-
-            // Use current date as the base for scheduling
-            const currentDate = moment().format('YYYY-MM-DD');
-
-            for (let i = 0; i < selectedLines.length; i++) {
-                const line = selectedLines[i];
-                if (!line) {
-                    updatedLines.push('');
-                    continue;
-                }
-                const trimmedLine = line.trim();
-
-                // Keep non-task lines as-is
-                if (!trimmedLine.startsWith('- [')) {
-                    updatedLines.push(line);
-                    continue;
-                }
-
-                // Skip completed and cancelled tasks
-                if (this.isCompletedTask(trimmedLine) || this.isDeletedTask(trimmedLine)) {
-                    updatedLines.push(line);
-                    continue;
-                }
-
-                // Skip tasks already marked as scheduled or migrated
-                if (trimmedLine.includes('[s]') || trimmedLine.includes('[<]') || /\[>\]/.test(trimmedLine)) {
-                    updatedLines.push(line);
-                    continue;
-                }
-
-                // Only process tasks with migration markers
-                if (!this.hasMigrationMarker(trimmedLine)) {
-                    updatedLines.push(line);
-                    continue;
-                }
-
-                // Schedule the task
-                const result = await this.migrateTaskForPlan(
-                    line,
-                    activeFile.path,
-                    currentDate,
-                    'weekly'
-                );
-
-                if (result.success) {
-                    scheduledCount++;
-                    // Update the line to show it's been scheduled [s]
-                    const updatedLine = line.replace(/- \[[^\]]+\]/, '- [s]');
-                    updatedLines.push(updatedLine);
-                } else {
-                    errors.push(result.error || 'Unknown error');
-                    updatedLines.push(line); // Keep original on failure
-                }
-            }
-
-            // Update the selection with scheduled markers
-            editor.replaceSelection(updatedLines.join('\n'));
-
-            const message = `Tasks scheduled!\n✓ ${scheduledCount} tasks scheduled${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Scheduling errors:', errors);
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Schedule selected tasks error:', error);
-        }
+        return taskCommands.scheduleSelectedTasks(this, editor);
     }
 
-    /**
-     * Migrate Tasks - Smart command that detects note type and migrates tasks accordingly
-     * Used for all journal notes (daily/weekly/monthly/yearly/future) and review documents
-     */
     async migrateTasks(): Promise<void> {
-        try {
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice('Please open a note to process');
-                return;
-            }
-
-            const path = activeFile.path;
-
-            // Detect note type and call appropriate method
-            // Reviews first (more specific paths)
-            if (path.includes('Bujo Reviews/Weekly')) {
-                return await this.migrateWeeklyReview();
-            } else if (path.includes('Bujo Reviews/Monthly')) {
-                return await this.migrateMonthlyReview();
-            } else if (path.includes('Bujo Reviews/Global')) {
-                return await this.migrateGlobalReview();
-            }
-            // Journal notes
-            else if (path.includes('Daily Notes') || path.includes('001 Daily')) {
-                return await this.migrateJournalNote('daily');
-            } else if (path.includes('Weekly Notes') || path.includes('002 Weekly')) {
-                return await this.migrateJournalNote('weekly');
-            } else if (path.includes('Monthly Notes') || path.includes('003 Monthly')) {
-                return await this.migrateJournalNote('monthly');
-            } else if (path.includes('Yearly Notes') || path.includes('004 Yearly')) {
-                return await this.migrateJournalNote('yearly');
-            } else if (path.includes('Future Log') || path.includes('004 Future') || path.includes('006 Future')) {
-                return await this.migrateJournalNote('future');
-            } else {
-                new Notice('Cannot migrate from this note type. Please open a journal note or review document.');
-                return;
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Migrate tasks error:', error);
-        }
+        return taskCommands.migrateTasks(this);
     }
 
-    /**
-     * Process any journal note type for migration (daily, weekly, monthly, yearly, future)
-     */
     async migrateJournalNote(periodType: PeriodType | 'future'): Promise<void> {
-        const periodNames: Record<string, string> = {
-            daily: 'daily',
-            weekly: 'weekly',
-            monthly: 'monthly',
-            yearly: 'yearly',
-            future: 'future log'
-        };
-
-        const periodName = periodNames[periodType] || periodType;
-
-        try {
-            new Notice(`Processing ${periodName} note...`);
-
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice(`Please open a ${periodName} note`);
-                return;
-            }
-
-            const sourceDate = this.getDateFromFilePath(activeFile.path);
-            if (!sourceDate && periodType !== 'future') {
-                new Notice('Could not determine date from filename');
-                return;
-            }
-
-            const content = await this.app.vault.read(activeFile as TFile);
-            const lines = content.split('\n');
-
-            let migratedCount = 0;
-            let newTaskCount = 0;
-            let completedCount = 0;
-            let deletedCount = 0;
-            const errors: string[] = [];
-
-            for (const line of lines) {
-                const trimmedLine = line.trim();
-                if (!this.isBulletItem(trimmedLine)) continue;
-
-                // Skip completed and cancelled tasks
-                if (this.isCompletedTask(trimmedLine)) {
-                    completedCount++;
-                    continue;
-                }
-
-                if (this.isDeletedTask(trimmedLine)) {
-                    completedCount++;
-                    continue;
-                }
-                
-                // Skip already processed new tasks [+]
-                if (/^-\s*\[\+\]/.test(trimmedLine)) {
-                    console.log(`[BuJo] Skipping already-created new task: "${trimmedLine.substring(0, 50)}"`);
-                    continue;
-                }
-
-                // Handle delete marker [d]
-                const parsed = this.parseMigrationMarker(trimmedLine);
-                if (parsed && parsed.marker === 'delete') {
-                    try {
-                        const result = await this.deleteTask(line, activeFile.path);
-                        if (result.success) {
-                            deletedCount++;
-                        } else {
-                            errors.push(`Delete failed: ${result.error}`);
-                        }
-                    } catch (error) {
-                        const errorMessage = error instanceof Error ? error.message : String(error);
-                        errors.push(`Delete error: ${errorMessage}`);
-                    }
-                    continue;
-                }
-
-                // Check if this is a new task marker [+>
-                const isNewTaskMarker = parsed && parsed.isNewTask;
-
-                // Handle new tasks (don't require source path)
-                if (isNewTaskMarker && this.hasMigrationMarker(trimmedLine)) {
-                    const effectiveDate = sourceDate || moment().format('YYYY-MM-DD');
-                    console.log(`[BuJo] Creating new task: "${this.getTaskText(trimmedLine)}"`);
-                    const result = await this.createNewTask(line, effectiveDate);
-                    if (result.success) {
-                        newTaskCount++;
-                        migratedCount++;
-                        console.log(`[BuJo] Successfully created new task in ${result.destFile}`);
-                        
-                        // Mark as created with [+] (similar to how migrations mark as [>])
-                        try {
-                            const taskText = this.getTaskText(line);
-                            const indent = line.match(/^(\s*)/)?.[0] || '';
-                            const updatedLine = `${indent}- [+] ${taskText}`;
-                            await this.updateTaskInFile(activeFile.path, line, updatedLine);
-                            console.log(`[BuJo] Marked new task as created [+] in source file`);
-                        } catch (updateError) {
-                            console.error(`[BuJo] Failed to mark new task as created:`, updateError);
-                            // Don't fail the whole operation if we can't mark it
-                        }
-                    } else {
-                        errors.push(`New task creation failed: ${result.error}`);
-                        console.error(`[BuJo] Failed to create new task: ${result.error}`);
-                    }
-                    continue;
-                }
-
-                // Handle migration markers
-                if (this.hasMigrationMarker(trimmedLine)) {
-                    try {
-                        const effectivePeriodType = periodType === 'future' ? 'daily' : periodType;
-                        const effectiveDate = sourceDate || moment().format('YYYY-MM-DD');
-
-                        const result = await this.migrateTask(
-                            line,
-                            activeFile.path,
-                            effectiveDate,
-                            effectivePeriodType as PeriodType
-                        );
-
-                        if (result.success && !result.skipped) {
-                            migratedCount++;
-                        } else if (result.success && result.skipped) {
-                            console.log(`[BuJo] Task marked but not migrated: "${trimmedLine.substring(0, 50)}"`);
-                        } else {
-                            if (result.error && result.error.includes('Unknown migration marker')) {
-                                console.log(`[BuJo] Skipping invalid marker: "${trimmedLine.substring(0, 50)}"`);
-                            } else {
-                                errors.push(`Migration failed: ${result.error}`);
-                            }
-                        }
-                    } catch (error) {
-                        const errorMessage = error instanceof Error ? error.message : String(error);
-                        if (errorMessage.includes('Unknown migration marker')) {
-                            console.log(`[BuJo] Skipping invalid marker: "${trimmedLine.substring(0, 50)}"`);
-                        } else {
-                            errors.push(`Migration error: ${errorMessage}`);
-                        }
-                    }
-                }
-            }
-
-            const periodLabel = periodName.charAt(0).toUpperCase() + periodName.slice(1);
-            const message = `${periodLabel} note processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}${deletedCount > 0 ? `, ${deletedCount} deleted` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-            new Notice(message, 5000);
-
-            if (errors.length > 0) {
-                console.error('Processing errors:', errors);
-                console.error('Error details:', errors.map((e, i) => `${i + 1}. ${e}`).join('\n'));
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error(`Process ${periodName} note error:`, error);
-        }
+        return taskCommands.migrateJournalNote(this, periodType);
     }
 
-    /**
-     * Schedule Tasks - Universal command that works from any note to schedule tasks
-     */
     async scheduleTasks(): Promise<void> {
-        try {
-            const activeFile = this.app.workspace.getActiveFile();
-            if (!activeFile) {
-                new Notice('Please open a note with tasks to schedule');
-                return;
-            }
-
-            const path = activeFile.path;
-
-            // If we're in a weekly or monthly note, use the plan scheduler
-            if (path.includes('002 Weekly Notes') || path.includes('Weekly Notes')) {
-                return await this.schedulePlan('weekly');
-            } else if (path.includes('003 Monthly Notes') || path.includes('Monthly Notes')) {
-                return await this.schedulePlan('monthly');
-            } else {
-                // For any other note type (project notes, daily notes, etc.),
-                // treat it like a weekly plan by default
-                new Notice('Scheduling tasks from this note...');
-
-                // Get the content
-                const content = await this.app.vault.read(activeFile as TFile);
-                const lines = content.split('\n');
-
-                let scheduledCount = 0;
-                const errors = [];
-
-                // For now, we'll use the current week as the default scheduling target
-                const currentWeekDate = moment().startOf('isoWeek').format('YYYY-MM-DD');
-
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i];
-                    if (!line) continue;
-                    const trimmedLine = line.trim();
-
-                    if (!trimmedLine.startsWith('- [')) continue;
-
-                    // Skip completed and deleted tasks
-                    if (this.isCompletedTask(trimmedLine) || this.isDeletedTask(trimmedLine)) {
-                        continue;
-                    }
-
-                    // Only process tasks with migration markers
-                    if (!this.hasMigrationMarker(trimmedLine)) {
-                        continue;
-                    }
-
-                    // Schedule the task using migrateTaskForPlan
-                    const result = await this.migrateTaskForPlan(
-                        line,
-                        activeFile.path,
-                        currentWeekDate,
-                        'weekly'
-                    );
-
-                    if (result.success) {
-                        scheduledCount++;
-                    } else {
-                        errors.push(result.error || 'Unknown error');
-                    }
-                }
-
-                const message = `Tasks scheduled!\n✓ ${scheduledCount} tasks scheduled${errors.length > 0 ? `\n⚠ ${errors.length} errors` : ''}`;
-                new Notice(message, 5000);
-
-                if (errors.length > 0) {
-                    console.error('Scheduling errors:', errors);
-                }
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            new Notice(`Error: ${errorMessage}`);
-            console.error('Schedule tasks error:', error);
-        }
+        return taskCommands.scheduleTasks(this);
     }
 }

@@ -17,20 +17,62 @@ This plugin implements a complete bullet journal migration system for Obsidian, 
 
 > **Reliability:** task lookups use Obsidian's metadata cache and all edits are written atomically, so migrations locate the right task and won't clobber concurrent edits (e.g. from Sync).
 
-## Required Folder Structure
+## Folder Structure
 
-The plugin expects the following folder structure in your vault:
+Out of the box the plugin looks for this layout:
 
 ```
 Journal/
 ├── 001 Daily Notes/        # Daily notes (YYYY-MM-DD.md)
 ├── 002 Weekly Notes/       # Weekly notes (YYYY-Www.md)
 ├── 003 Monthly Notes/      # Monthly notes (YYYY-MM.md)
-├── 004 Future Log/         # Future log (Future.md)
-├── 005 Weekly Reviews/     # Generated weekly reviews
-├── 006 Monthly Reviews/    # Generated monthly reviews
-└── 007 Global Reviews/     # Generated global reviews
+├── 004 Yearly Notes/       # Yearly notes (YYYY.md)
+├── 006 Future Log/         # Future log (YYYY - Future Log.md)
+└── Bujo Reviews/           # Generated reviews
+    ├── Weekly/             #   YYYY-Www-Review.md
+    ├── Monthly/            #   YYYY-MM-Review.md
+    └── Global/             #   Global-Review-YYYY-MM-DD-HHmm.md
 ```
+
+**The file names matter; the folder names don't.** Every folder above is
+configurable in **Settings → Bujo**, so point them wherever your vault already
+keeps these notes:
+
+| Setting | Default |
+|---------|---------|
+| Daily notes folder | `Journal/001 Daily Notes` |
+| Weekly notes folder | `Journal/002 Weekly Notes` |
+| Monthly notes folder | `Journal/003 Monthly Notes` |
+| Yearly notes folder | `Journal/004 Yearly Notes` |
+| Future log folder | `Journal/006 Future Log` |
+| Reviews folder | `Journal/Bujo Reviews` |
+| Templates folder | `Obsidian/Templator/Journal` |
+
+Notes are named by date — `2026-01-15.md`, `2026-W03.md`, `2026-01.md`,
+`2026.md` — and weekly notes use the **ISO week-year**, so a week spanning New
+Year belongs to the year that owns most of it (2024-12-30 lives in
+`2025-W01.md`).
+
+### Templates
+
+When a migration needs a note that doesn't exist yet, the plugin creates it from
+a template in the configured templates folder:
+
+| Note type | Template file |
+|-----------|---------------|
+| Daily | `Daily-Template.md` |
+| Weekly | `Weekly-Template.md` |
+| Monthly | `Monthly-Template.md` |
+| Future log | `Future-Log-Template.md` |
+
+[Templater](https://github.com/SilentVoid13/Templater) is used to expand the
+template if you have it installed. With no matching template the note is simply
+created with the task in it, so templates are optional.
+
+Migrated tasks are inserted under a `## Plan` heading in weekly and monthly
+notes, `## Notes` in daily notes, and under the matching month heading (or
+`## General`) in the future log. Without those headings the task is appended to
+the end of the note.
 
 ## Quick Entry (Autocomplete)
 
@@ -66,8 +108,8 @@ Add these markers as the checkbox in your task notes:
 | Marker | Description |
 |--------|-------------|
 | `[>mon]`, `[>tue]`, `[>wed]`, `[>thu]`, `[>fri]`, `[>sat]`, `[>sun]` | Next occurrence of that day |
-| `[>w1]`, `[>w2]`, `[>w3]`, `[>w4]` | 1-4 weeks from now |
-| `[>m3w]` | 3rd week of next month |
+| `[>w1]`, `[>w2]`, `[>w3]`, `[>w4]` | 1-4 weeks on from the note's own date |
+| `[>m1w]` … `[>m4w]` | Nth week of the month, rolling into next month if that week has already started |
 
 ### Specific Month Markers
 
@@ -139,18 +181,18 @@ Migrate items as plain list items (no checkboxes):
 
 ## Commands
 
-### Migrate Tasks
-**Command:** `Migrate Tasks`
+### Migrate tasks
+**Command:** `Migrate tasks`
 
 Processes the current note, migrating all marked tasks to their destinations. Auto-detects the note type (daily, weekly, monthly, or a generated review) — this is the one command you run to "process" whatever note you're in.
 
-### Migrate Selected Tasks
-**Command:** `Migrate Selected Tasks`
+### Migrate selected tasks
+**Command:** `Migrate selected tasks`
 
-Same as **Migrate Tasks**, but only processes the lines you have selected. Useful in review documents where you want to migrate a few items at a time.
+Same as **Migrate tasks**, but only processes the lines you have selected. Useful in review documents where you want to migrate a few items at a time.
 
-### Schedule Tasks / Schedule Selected Tasks
-**Commands:** `Schedule Tasks`, `Schedule Selected Tasks`
+### Schedule tasks / Schedule selected tasks
+**Commands:** `Schedule tasks`, `Schedule selected tasks`
 
 Like the migrate commands, but mark the source with `[s]` (scheduled) instead of `[>]` (migrated) — for planning notes where the task is being placed onto a future date rather than moved out.
 
@@ -159,10 +201,21 @@ Like the migrate commands, but mark the source with `[s]` (scheduled) instead of
 
 Lays down every occurrence of the current task from now until a date you choose, stepping by a customisable interval. See [Recurring Tasks](#recurring-tasks).
 
-### Generate Weekly / Monthly / Global Review
-**Commands:** `Generate Weekly Review`, `Generate Monthly Review`, `Generate Global Review`
+### Generate weekly / monthly / global review
+**Commands:** `Generate weekly review`, `Generate monthly review`, `Generate global review`
 
-Create a review document collecting all incomplete tasks for the period (the week's/month's daily notes and higher-level notes; the global review spans all periods). Add markers to the review, then run **Migrate Tasks** on it to send everything to its destination.
+Create a review document collecting all incomplete tasks for the period (the week's/month's daily notes and higher-level notes; the global review spans all periods). Add markers to the review, then run **Migrate tasks** on it to send everything to its destination.
+
+Once every task in a review has been dealt with, the review file is moved to the
+vault trash. If anything failed to migrate, the review is **kept** so you can see
+what is outstanding and run it again — the notice tells you how many failed.
+
+## Settings
+
+**Settings → Bujo** configures where the plugin reads and writes:
+
+- **Folders** — the seven paths listed under [Folder Structure](#folder-structure). Clearing a box restores its default.
+- **Debug logging** — off by default. Turn it on to trace migrations in the developer console (**Ctrl/Cmd + Shift + I**) when a task ends up somewhere unexpected. Warnings and errors are always logged.
 
 ## Recurring Tasks
 
@@ -184,12 +237,12 @@ Every occurrence is created as a plain `- [ ]` task in the matching note, up to 
    - [>>] Review presentation
    - [>m{o}] Plan vacation event
    ```
-3. Run "Migrate Tasks" command
+3. Run "Migrate tasks" command
 4. Tasks are automatically migrated to their destinations
 
 ### Weekly Review Workflow
 
-1. Run "Generate Weekly Review" command
+1. Run "Generate weekly review" command
 2. Review the generated list of incomplete tasks
 3. Add migration markers as checkboxes:
    ```markdown
@@ -197,15 +250,15 @@ Every occurrence is created as a plain `- [ ]` task in the matching note, up to 
    - [>fut] Read article
    - [<] Update documentation
    ```
-4. Run "Migrate Tasks" command (on the review document)
+4. Run "Migrate tasks" command (on the review document)
 5. Tasks are migrated accordingly
 
 ### Monthly Planning Workflow
 
-1. Run "Generate Monthly Review" command
+1. Run "Generate monthly review" command
 2. Review all incomplete tasks from the month
 3. Add markers to schedule tasks for next month
-4. Run "Migrate Tasks" command (on the review document)
+4. Run "Migrate tasks" command (on the review document)
 
 ## Task Migration Behavior
 
@@ -353,6 +406,12 @@ npm install
 # Build the plugin
 npm run build
 
+# Run the unit tests (marker resolution, recurrence, path handling)
+npm test
+
+# Lint against the Obsidian plugin guidelines
+npm run lint
+
 # Set up symlinks for development
 npm run setup
 # (Edit dev-setup.sh first to set your vault path)
@@ -360,6 +419,11 @@ npm run setup
 # Start development with auto-rebuild
 npm run dev
 ```
+
+Tests run outside Obsidian: `tests/run.mjs` bundles them with esbuild, swapping
+the `obsidian` import for a stub, and hands the result to node's built-in test
+runner. Only the pure modules are covered — marker resolution, recurrence, path
+building, and line parsing.
 
 ## Support
 

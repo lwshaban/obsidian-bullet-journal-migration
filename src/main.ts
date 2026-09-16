@@ -1,9 +1,11 @@
 import { Plugin } from 'obsidian';
 import { BulletJournalMigration } from './bulletJournalMigration';
-import { DEFAULT_SETTINGS, BujoPluginSettings, BujoSettingTab } from './settings';
+import { DEFAULT_SETTINGS, BujoPluginSettings } from './settings';
+import { BujoSettingTab } from './settings-tab';
 import { MigrationSuggest } from './migration-suggest';
 import { RecurringScheduleModal } from './recurring-ui';
 import { getTaskText } from './utils';
+import { setDebugLogging } from './log';
 
 export default class BujoMigrationPlugin extends Plugin {
 	settings: BujoPluginSettings;
@@ -12,8 +14,9 @@ export default class BujoMigrationPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// Initialize the Bujo migration system
-		this.bujo = new BulletJournalMigration(this.app);
+		// Initialize the Bujo migration system. Settings are passed as a getter
+		// so folder changes apply without a reload.
+		this.bujo = new BulletJournalMigration(this.app, () => this.settings);
 
 		// Autocomplete for migration markers: type "[>" in a task line
 		this.registerEditorSuggest(new MigrationSuggest(this.app));
@@ -28,43 +31,43 @@ export default class BujoMigrationPlugin extends Plugin {
 	registerCommands() {
 		this.addCommand({
 			id: 'bujo-generate-monthly-review',
-			name: 'Generate Monthly Review',
+			name: 'Generate monthly review',
 			callback: () => this.bujo.generateMonthlyReview()
 		});
 
 		this.addCommand({
 			id: 'bujo-generate-weekly-review',
-			name: 'Generate Weekly Review',
+			name: 'Generate weekly review',
 			callback: () => this.bujo.generateWeeklyReview()
 		});
 
 		this.addCommand({
 			id: 'bujo-migrate-selected-tasks',
-			name: 'Migrate Selected Tasks',
+			name: 'Migrate selected tasks',
 			editorCallback: (editor) => this.bujo.migrateSelectedTasks(editor)
 		});
 
 		this.addCommand({
 			id: 'bujo-migrate-tasks',
-			name: 'Migrate Tasks',
+			name: 'Migrate tasks',
 			callback: () => this.bujo.migrateTasks()
 		});
 
 		this.addCommand({
 			id: 'bujo-schedule-selected-tasks',
-			name: 'Schedule Selected Tasks',
+			name: 'Schedule selected tasks',
 			editorCallback: (editor) => this.bujo.scheduleSelectedTasks(editor)
 		});
 
 		this.addCommand({
 			id: 'bujo-schedule-tasks',
-			name: 'Schedule Tasks',
+			name: 'Schedule tasks',
 			callback: () => this.bujo.scheduleTasks()
 		});
 
 		this.addCommand({
 			id: 'bujo-generate-global-review',
-			name: 'Generate Global Review',
+			name: 'Generate global review',
 			callback: () => this.bujo.generateGlobalReview()
 		});
 
@@ -85,10 +88,13 @@ export default class BujoMigrationPlugin extends Plugin {
 	// ── Settings ──
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = (await this.loadData()) as Partial<BujoPluginSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved ?? {});
+		setDebugLogging(this.settings.debugLogging);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+		setDebugLogging(this.settings.debugLogging);
 	}
 }

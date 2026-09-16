@@ -41,7 +41,7 @@ function anchorFromFile(file: TFile | null): moment.Moment {
 	}
 	const wk = name.match(/^(\d{4})-W(\d{2})$/i);
 	if (wk && wk[1] && wk[2]) {
-		const m = moment().year(parseInt(wk[1], 10)).isoWeek(parseInt(wk[2], 10)).startOf('isoWeek');
+		const m = moment().isoWeekYear(parseInt(wk[1], 10)).isoWeek(parseInt(wk[2], 10)).startOf('isoWeek');
 		if (m.isValid()) return m;
 	}
 	if (/^\d{4}-\d{2}$/.test(name)) {
@@ -72,7 +72,7 @@ function explicitSuggestion(query: string): DestSuggestion | null {
 	}
 	const weekMatch = query.match(/^(\d{4})-w(\d{2})$/i);
 	if (weekMatch && weekMatch[1] && weekMatch[2]) {
-		const m = moment().year(parseInt(weekMatch[1], 10)).isoWeek(parseInt(weekMatch[2], 10)).startOf('isoWeek');
+		const m = moment().isoWeekYear(parseInt(weekMatch[1], 10)).isoWeek(parseInt(weekMatch[2], 10)).startOf('isoWeek');
 		if (m.isValid()) return { label: `Week ${weekMatch[2]}, ${weekMatch[1]}`, sub: m.format('[starts] MMM D'), code: query.toUpperCase() };
 		return null;
 	}

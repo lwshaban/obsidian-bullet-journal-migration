@@ -25,3 +25,6 @@ data.json
 dev-setup.sh
 commit_msg.txt
 .claude/
+
+# Test runner output
+tests/.build
