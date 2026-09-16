@@ -2,10 +2,14 @@ name: Release
 
 # Obsidian resolves a plugin release by looking for a tag that exactly matches
 # manifest.json's version — no "v" prefix. Tag as "0.4.0", not "v0.4.0".
+#
+# The trailing * also admits pre-release tags like "0.4.1-beta.1". BRAT treats
+# the release tag as the source of truth and installs straight from the release
+# assets, so a pre-release tag is all a beta channel needs.
 on:
     push:
         tags:
-            - "[0-9]+.[0-9]+.[0-9]+"
+            - "[0-9]+.[0-9]+.[0-9]+*"
 
 permissions:
     contents: write
@@ -25,17 +29,31 @@ jobs:
             - run: npm ci
 
             - name: Verify tag matches manifest version
+              id: check
               run: |
                   TAG="${GITHUB_REF_NAME}"
                   MANIFEST_VERSION="$(jq -r .version manifest.json)"
+
+                  # Obsidian and BRAT both require tag, release name, and the
+                  # version inside the released manifest.json to be identical.
                   if [ "$TAG" != "$MANIFEST_VERSION" ]; then
                       echo "Tag $TAG does not match manifest.json version $MANIFEST_VERSION" >&2
                       exit 1
                   fi
-                  if [ "$(jq -r --arg v "$TAG" '.[$v] // empty' versions.json)" = "" ]; then
-                      echo "versions.json has no entry for $TAG" >&2
-                      exit 1
-                  fi
+
+                  # A hyphen marks a pre-release (0.4.1-beta.1). Those are BRAT-only
+                  # and never enter versions.json, which exists for the community
+                  # catalog's stable-version-to-minAppVersion mapping.
+                  case "$TAG" in
+                      *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+                      *)
+                          echo "prerelease=false" >> "$GITHUB_OUTPUT"
+                          if [ "$(jq -r --arg v "$TAG" '.[$v] // empty' versions.json)" = "" ]; then
+                              echo "versions.json has no entry for $TAG" >&2
+                              exit 1
+                          fi
+                          ;;
+                  esac
 
             - run: npm run lint
 
@@ -46,8 +64,16 @@ jobs:
             - name: Create release
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PRERELEASE: ${{ steps.check.outputs.prerelease }}
               run: |
+                  # Release name must equal the tag; assets go up individually,
+                  # not zipped — that is what Obsidian and BRAT fetch.
+                  FLAGS=""
+                  if [ "$PRERELEASE" = "true" ]; then
+                      FLAGS="--prerelease"
+                  fi
                   gh release create "${GITHUB_REF_NAME}" \
                       --title "${GITHUB_REF_NAME}" \
                       --generate-notes \
+                      $FLAGS \
                       main.js manifest.json styles.css
