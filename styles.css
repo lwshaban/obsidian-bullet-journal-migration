@@ -369,3 +369,19 @@ body:not(.tasks) li[data-task="H"].task-list-item.is-checked {
 	color: var(--text-muted);
 	margin-top: 10px;
 }
+
+/* Alt+N quick-select badge in the migration destination suggester. */
+.bujo-suggest-index {
+	flex: 0 0 auto;
+	margin-right: var(--size-4-2);
+	min-width: 1.4em;
+	padding: 0 0.3em;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	font-family: var(--font-monospace);
+	font-size: var(--font-smaller);
+	line-height: 1.5;
+	text-align: center;
+}

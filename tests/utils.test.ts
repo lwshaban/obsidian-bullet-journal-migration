@@ -13,6 +13,10 @@ import {
 	getIndentLevel,
 	removeMetadata,
 	collectChildTasks,
+	sanitizeAncestorContext,
+	clampIndent,
+	MAX_ANCESTOR_CONTEXT,
+	MAX_WRITE_INDENT,
 } from '../src/utils';
 
 test('normalizeText folds case, whitespace, and wikilinks', () => {
@@ -108,4 +112,53 @@ test('children are collected relative to the parent\'s own indent', () => {
 	];
 
 	assert.deepEqual(collectChildTasks(lines, 0, 4).map(c => c.line.trim()), ['- [ ] Its child']);
+});
+
+// ── Ancestor context sanitation ───────────────────────────────────────────────
+
+test('sanitizeAncestorContext drops an ancestor that is really the task itself', () => {
+	// A task whose text starts with a bullet dash ("- [>w] - Add Sandy") renders
+	// its context line as "- - Add Sandy", which normalizes to the same thing as
+	// the task. Nesting that under itself grows one level per run.
+	assert.deepEqual(
+		sanitizeAncestorContext(['- Add [[Sandy Shaban]]'], '- Add [[Sandy Shaban]]'),
+		[],
+	);
+	assert.deepEqual(sanitizeAncestorContext(['Groceries'], '- Add milk'), ['Groceries']);
+});
+
+test('sanitizeAncestorContext collapses repeated ancestors', () => {
+	assert.deepEqual(
+		sanitizeAncestorContext(['Project', 'Project', 'Phase one'], 'Write spec'),
+		['Project', 'Phase one'],
+	);
+});
+
+test('sanitizeAncestorContext keeps the innermost levels and caps the chain', () => {
+	const chain = Array.from({ length: 20 }, (_, i) => `Level ${i}`);
+	const kept = sanitizeAncestorContext(chain, 'Deep task');
+
+	assert.equal(kept.length, MAX_ANCESTOR_CONTEXT);
+	// Innermost parents are the useful context, so those are the ones retained.
+	assert.equal(kept[kept.length - 1], 'Level 19');
+	assert.equal(kept[0], `Level ${20 - MAX_ANCESTOR_CONTEXT}`);
+});
+
+test('sanitizeAncestorContext discards blanks', () => {
+	assert.deepEqual(sanitizeAncestorContext(['', '   ', 'Real'], 'Task'), ['Real']);
+});
+
+test('clampIndent leaves ordinary nesting alone', () => {
+	const lines = ['- [ ] Top', '\t- [ ] Child', '\t\t- [ ] Grandchild'];
+	assert.deepEqual(clampIndent(lines), lines);
+});
+
+test('clampIndent flattens nesting that would overflow the tokenizer', () => {
+	const runaway = Array.from({ length: 200 }, (_, i) => '\t'.repeat(i) + '- [ ] Task');
+	const clamped = clampIndent(runaway);
+
+	const depths = clamped.map(l => (l.match(/^\t*/)?.[0] ?? '').length);
+	assert.equal(Math.max(...depths), MAX_WRITE_INDENT);
+	// Content is preserved — only the leading whitespace is rewritten.
+	assert.ok(clamped.every(l => l.trimStart() === '- [ ] Task'));
 });

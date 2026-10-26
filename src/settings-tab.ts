@@ -48,6 +48,28 @@ export class BujoSettingTab extends PluginSettingTab {
 					}));
 		}
 
+		new Setting(containerEl).setName('Keyboard').setHeading();
+
+		new Setting(containerEl)
+			.setName('Advance after marking')
+			.setDesc('After a migration marker is applied, jump to the next task in the note.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.autoAdvance)
+				.onChange(async (value) => {
+					this.plugin.settings.autoAdvance = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Open the picker on arrival')
+			.setDesc('When you land on an unticked task, set it to "[>]" and open the destination picker so you can choose straight away. Ticked, cancelled and already-marked tasks are left alone. Dismissing the picker puts the line back.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.advanceOpensPicker)
+				.onChange(async (value) => {
+					this.plugin.settings.advanceOpensPicker = value;
+					await this.plugin.saveSettings();
+				}));
+
 		new Setting(containerEl).setName('Advanced').setHeading();
 
 		new Setting(containerEl)

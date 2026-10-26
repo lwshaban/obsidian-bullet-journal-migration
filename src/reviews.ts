@@ -147,6 +147,7 @@ export async function migrateWeeklyReview(bujo: BulletJournalMigration): Promise
         let completedCount = 0;
         let deletedCount = 0;
         const errors = [];
+        let blankCount = 0;
         let currentSourcePath = null;
         const processedLines = new Set(); // Track lines that have been processed as children
 
@@ -169,6 +170,17 @@ export async function migrateWeeklyReview(bujo: BulletJournalMigration): Promise
             }
             
             if (!bujo.isBulletItem(trimmedLine)) continue;
+
+            // A marker with nothing after it (a stray "- [d]") has no task to
+            // act on. Skipping beats failing: one abandoned line should not
+            // keep an otherwise-complete review from being filed away.
+            if (!bujo.getTaskText(trimmedLine)) {
+                if (bujo.hasMigrationMarker(trimmedLine)) {
+                    log.warn(`Skipping empty marker line in ${reviewPath}: "${trimmedLine}"`);
+                    blankCount++;
+                }
+                continue;
+            }
 
             // Check if this is a new task marker [+>
             const parsedMarker = bujo.parseMigrationMarker(trimmedLine);
@@ -307,7 +319,7 @@ export async function migrateWeeklyReview(bujo: BulletJournalMigration): Promise
             log.warn(`Keeping ${reviewPath}: ${errors.length} task(s) could not be migrated`);
         }
 
-        const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
+        const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${blankCount > 0 ? `\n• ${blankCount} blank marker line(s) skipped` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
         new Notice(message, 5000);
 
         if (errors.length > 0) {
@@ -476,6 +488,7 @@ export async function migrateMonthlyReview(bujo: BulletJournalMigration): Promis
         let completedCount = 0;
         let deletedCount = 0;
         const errors = [];
+        let blankCount = 0;
         let currentSourcePath = null;
         const processedLines = new Set(); // Track lines that have been processed as children
 
@@ -503,6 +516,17 @@ export async function migrateMonthlyReview(bujo: BulletJournalMigration): Promis
             }
 
             if (!bujo.isBulletItem(trimmedLine)) continue;
+
+            // A marker with nothing after it (a stray "- [d]") has no task to
+            // act on. Skipping beats failing: one abandoned line should not
+            // keep an otherwise-complete review from being filed away.
+            if (!bujo.getTaskText(trimmedLine)) {
+                if (bujo.hasMigrationMarker(trimmedLine)) {
+                    log.warn(`Skipping empty marker line in ${reviewPath}: "${trimmedLine}"`);
+                    blankCount++;
+                }
+                continue;
+            }
 
             // Check if this is a new task marker [+>
             const parsedMarker = bujo.parseMigrationMarker(trimmedLine);
@@ -634,7 +658,7 @@ export async function migrateMonthlyReview(bujo: BulletJournalMigration): Promis
             log.warn(`Keeping ${reviewPath}: ${errors.length} task(s) could not be migrated`);
         }
 
-        const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
+        const message = `Review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${blankCount > 0 ? `\n• ${blankCount} blank marker line(s) skipped` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
         new Notice(message, 5000);
 
         if (errors.length > 0) {
@@ -819,6 +843,7 @@ export async function migrateGlobalReview(bujo: BulletJournalMigration): Promise
         let deletedCount = 0;
         let newTaskCount = 0;
         const errors = [];
+        let blankCount = 0;
         let currentSourcePath = null;
 
         for (let i = 0; i < lines.length; i++) {
@@ -841,6 +866,17 @@ export async function migrateGlobalReview(bujo: BulletJournalMigration): Promise
             }
             
             if (!bujo.isBulletItem(trimmedLine)) continue;
+
+            // A marker with nothing after it (a stray "- [d]") has no task to
+            // act on. Skipping beats failing: one abandoned line should not
+            // keep an otherwise-complete review from being filed away.
+            if (!bujo.getTaskText(trimmedLine)) {
+                if (bujo.hasMigrationMarker(trimmedLine)) {
+                    log.warn(`Skipping empty marker line in ${reviewPath}: "${trimmedLine}"`);
+                    blankCount++;
+                }
+                continue;
+            }
 
             // Check if this is a new task marker [+>
             const parsedMarker = bujo.parseMigrationMarker(trimmedLine);
@@ -948,7 +984,7 @@ export async function migrateGlobalReview(bujo: BulletJournalMigration): Promise
             log.warn(`Keeping ${reviewPath}: ${errors.length} task(s) could not be migrated`);
         }
 
-        const message = `Global review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
+        const message = `Global review processed!\n✓ ${migratedCount} tasks migrated${newTaskCount > 0 ? ` (${newTaskCount} new)` : ''}\n✓ ${completedCount} tasks completed\n✓ ${deletedCount} tasks deleted${blankCount > 0 ? `\n• ${blankCount} blank marker line(s) skipped` : ''}${errors.length > 0 ? `\n⚠ ${errors.length} errors — review kept for retry` : ''}`;
         new Notice(message, 5000);
 
         if (errors.length > 0) log.error('Processing errors:', errors);

@@ -11,6 +11,10 @@ export interface BujoPluginSettings {
 	reviewsPath: string;
 	templatesPath: string;
 	debugLogging: boolean;
+	/** Jump to the next task after a marker is applied. */
+	autoAdvance: boolean;
+	/** On advancing, open the next task's destination picker immediately. */
+	advanceOpensPicker: boolean;
 }
 
 export const DEFAULT_SETTINGS: BujoPluginSettings = {
@@ -22,4 +26,6 @@ export const DEFAULT_SETTINGS: BujoPluginSettings = {
 	reviewsPath: 'Journal/Bujo Reviews',
 	templatesPath: 'Obsidian/Templator/Journal',
 	debugLogging: false,
+	autoAdvance: true,
+	advanceOpensPicker: true,
 };

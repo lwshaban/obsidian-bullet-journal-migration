@@ -74,10 +74,16 @@ export function locateTaskLine(
 }
 
 /**
+ * Deepest list nesting we treat as real. Anything past this is a symptom of a
+ * stale or corrupt cache, not a bullet journal — bail to the indent walk.
+ */
+const MAX_NESTING = 64;
+
+/**
  * Ancestor list-item line numbers for the item at `line`, outermost first
  * (e.g. [grandparent, parent]). Empty array = top-level item. Returns null
- * when the cache has no list items or doesn't know this line, so callers can
- * fall back to indent-based detection.
+ * when the cache has no list items, doesn't know this line, or describes a
+ * hierarchy we refuse to trust, so callers can fall back to indent detection.
  */
 export function ancestorLines(cache: CachedMetadata | null | undefined, line: number): number[] | null {
 	const items = cache?.listItems;
@@ -89,10 +95,19 @@ export function ancestorLines(cache: CachedMetadata | null | undefined, line: nu
 
 	const chain: number[] = [];
 	// listItem.parent is the parent's line number when positive; a negative
-	// value means the item is top-level (points at its containing section)
+	// value means the item is top-level (points at its containing section).
+	//
+	// A mid-rebuild cache can hand back parent pointers that form a cycle. A
+	// counter guard would "succeed" with a chain as long as the limit, and the
+	// caller would faithfully write out that many nested context bullets — a
+	// 1000-deep list that overflows Obsidian's own markdown tokenizer. Track
+	// what we've visited instead and refuse the whole answer on a cycle.
+	const seen = new Set<number>([line]);
 	let parent = self.parent;
-	let guard = 0;
-	while (parent >= 0 && guard++ < 1000) {
+	while (parent >= 0) {
+		if (seen.has(parent)) return null;      // cycle — don't trust the cache
+		if (chain.length >= MAX_NESTING) return null;
+		seen.add(parent);
 		chain.push(parent);
 		parent = byLine.get(parent)?.parent ?? -1;
 	}
@@ -113,12 +128,17 @@ export function descendantLines(cache: CachedMetadata | null | undefined, parent
 
 	const result: number[] = [];
 	for (const item of items) {
+		const self = item.position.start.line;
+		// Walk up the parent chain (negative parent = top-level item), with the
+		// same cycle guard as ancestorLines — a counter would silently treat a
+		// looping chain as "not a descendant" after 1000 wasted hops.
+		const seen = new Set<number>([self]);
 		let parent = item.parent;
-		let guard = 0;
-		// Walk up the parent chain (negative parent = top-level item)
-		while (parent >= 0 && guard++ < 1000) {
+		while (parent >= 0) {
+			if (seen.has(parent)) break;        // cycle — this item is unusable
+			seen.add(parent);
 			if (parent === parentLine) {
-				result.push(item.position.start.line);
+				result.push(self);
 				break;
 			}
 			parent = byLine.get(parent)?.parent ?? -1;

@@ -25,6 +25,9 @@ interface DestSuggestion {
 
 const PICK_DATE = '__pick__';
 
+/** How many entries get an Alt+N shortcut. */
+const QUICK_SELECT_MAX = 9;
+
 /**
  * Anchor date the relative markers resolve against — the note's own date when
  * it's a journal note (daily / weekly / monthly), otherwise today. So "next
@@ -56,6 +59,10 @@ function buildSuggestions(anchor: moment.Moment): DestSuggestion[] {
 	const nextWeek = describeMarker('w', anchor);
 	const nextMonth = describeMarker('m', anchor);
 	return [
+		// "Today" is always the literal today, not the anchor: pulling a task
+		// into the current day is the one destination that ignores which note
+		// you happen to be standing in. ":" is the engine's today marker.
+		{ label: 'Today', sub: moment().format('ddd, MMM D'), code: ':' },
 		{ label: 'Tomorrow', sub: tomorrow?.label ?? '', code: '>' },
 		{ label: 'Next week', sub: nextWeek?.sub ?? '', code: 'w' },
 		{ label: 'Next month', sub: nextMonth?.label ?? '', code: 'm' },
@@ -87,8 +94,68 @@ function explicitSuggestion(query: string): DestSuggestion | null {
 export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 	private prefix = '>';
 
+	/**
+	 * Called after a marker is actually written, including once the calendar
+	 * modal closes. Lets the keyboard flow advance to the next task only when
+	 * the user finished the job, never on a cancelled pick.
+	 */
+	onApplied: ((editor: Editor) => void) | null = null;
+
+	/** The list currently on screen, so a number key can index straight into it. */
+	private shown: DestSuggestion[] = [];
+
+	/**
+	 * Line to put back if the picker is dismissed without choosing. Opening the
+	 * picker writes a bare "[>]", which getIncompleteTasks treats as already
+	 * handled — walking away from it would drop the task out of every future
+	 * review. Armed by the keyboard flow, cleared the moment a marker lands.
+	 */
+	private pendingRevert: { editor: Editor; line: number; text: string } | null = null;
+
+	/** Arm the undo described on pendingRevert. */
+	armRevert(editor: Editor, line: number, text: string): void {
+		this.pendingRevert = { editor, line, text };
+	}
+
+	private takeRevert(): { editor: Editor; line: number; text: string } | null {
+		const pending = this.pendingRevert;
+		this.pendingRevert = null;
+		return pending;
+	}
+
+	/** Restore the line, but only if it is still the untouched "[>]" we wrote. */
+	private undo(pending: { editor: Editor; line: number; text: string } | null): void {
+		if (!pending) return;
+		const current = pending.editor.getLine(pending.line);
+		if (current !== undefined && /^\s*-\s*\[>\s*\]/.test(current)) {
+			pending.editor.setLine(pending.line, pending.text);
+		}
+	}
+
+	close(): void {
+		const pending = this.takeRevert();
+		super.close();
+		this.undo(pending);
+	}
+
 	constructor(app: App) {
 		super(app);
+
+		// Alt+1…9 picks the nth entry. Bare digits are off limits: the query
+		// accepts typed dates ("2026-10-26"), so digits have to reach the editor.
+		//
+		// Matched on evt.code rather than a registered key, because Scope
+		// compares KeyboardEvent.key — and on macOS Option+1 reports "¡", not
+		// "1", so a per-digit registration silently never fires there.
+		this.scope.register(['Alt'], null, (evt: KeyboardEvent) => {
+			const item = this.accelerated(evt.code);
+			if (!item) return;
+
+			evt.preventDefault();
+			this.selectSuggestion(item);
+			this.close();
+			return false;
+		});
 	}
 
 	onTrigger(cursor: EditorPosition, editor: Editor, _file: TFile | null): EditorSuggestTriggerInfo | null {
@@ -110,10 +177,10 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		const anchor = anchorFromFile(context.file);
 
 		const explicit = explicitSuggestion(query);
-		if (explicit) return [explicit];
+		if (explicit) return this.remember([explicit]);
 
 		const all = buildSuggestions(anchor);
-		if (!query) return all;
+		if (!query) return this.remember(all);
 
 		const filtered = all.filter(s => s.code.startsWith(query) || s.label.toLowerCase().includes(query));
 
@@ -127,13 +194,47 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 
 		// While typing a partial explicit date, keep the picker entry reachable
 		if (filtered.length === 0 && /^\d/.test(query)) {
-			return all.filter(s => s.code === PICK_DATE);
+			return this.remember(all.filter(s => s.code === PICK_DATE));
 		}
-		return filtered;
+		return this.remember(filtered);
+	}
+
+	private remember(items: DestSuggestion[]): DestSuggestion[] {
+		this.shown = items;
+		return items;
+	}
+
+	/**
+	 * Entries reachable by Alt+number. The calendar is excluded and given a
+	 * letter instead: it is always the last row, so numbering it would put the
+	 * most-reached entry on the longest stretch (Alt+5).
+	 */
+	private numbered(): DestSuggestion[] {
+		return this.shown.filter(s => s.code !== PICK_DATE);
+	}
+
+	/** The entry an Alt+<code> keystroke selects, if any. */
+	private accelerated(code: string): DestSuggestion | undefined {
+		if (code === 'KeyD') return this.shown.find(s => s.code === PICK_DATE);
+
+		const digit = /^Digit([1-9])$/.exec(code);
+		if (!digit || digit[1] === undefined) return undefined;
+		return this.numbered()[parseInt(digit[1], 10) - 1];
+	}
+
+	/** The accelerator shown on the left of a row: "1".."9", or "D" for the calendar. */
+	private badgeFor(item: DestSuggestion): string | null {
+		if (item.code === PICK_DATE) return 'D';
+		const index = this.numbered().indexOf(item);
+		return index >= 0 && index < QUICK_SELECT_MAX ? String(index + 1) : null;
 	}
 
 	renderSuggestion(item: DestSuggestion, el: HTMLElement): void {
 		el.addClass('mod-complex');
+
+		const badge = this.badgeFor(item);
+		if (badge) el.createDiv({ cls: 'bujo-suggest-index', text: badge });
+
 		const content = el.createDiv({ cls: 'suggestion-content' });
 		content.createDiv({ cls: 'suggestion-title', text: item.label });
 		content.createDiv({ cls: 'suggestion-note', text: item.sub });
@@ -160,13 +261,20 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		const insertMarker = (code: string) => {
 			const insert = `${prefix}${code}]${needsSpace ? ' ' : ''}`;
 			editor.replaceRange(insert, start, end);
+			this.onApplied?.(editor);
 		};
 
 		if (item.code === PICK_DATE) {
+			// Hand the undo to the modal: closing the suggester must not revert
+			// the line while the calendar is still open on top of it.
+			const pending = this.takeRevert();
 			this.close();
-			new DateDestinationModal(this.app, insertMarker).open();
+			new DateDestinationModal(this.app, insertMarker, () => this.undo(pending)).open();
 			return;
 		}
+
+		// A marker is about to land, so there is nothing to undo.
+		this.takeRevert();
 
 		insertMarker(item.code);
 	}
@@ -176,11 +284,14 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 
 export class DateDestinationModal extends Modal {
 	private onPick: (code: string) => void;
+	private onCancel: (() => void) | undefined;
+	private picked = false;
 	private viewDate: moment.Moment;
 
-	constructor(app: App, onPick: (code: string) => void) {
+	constructor(app: App, onPick: (code: string) => void, onCancel?: () => void) {
 		super(app);
 		this.onPick = onPick;
+		this.onCancel = onCancel;
 		this.viewDate = moment().startOf('month');
 	}
 
@@ -189,6 +300,7 @@ export class DateDestinationModal extends Modal {
 	}
 
 	private pick(code: string) {
+		this.picked = true;
 		this.close();
 		this.onPick(code);
 	}
@@ -266,5 +378,7 @@ export class DateDestinationModal extends Modal {
 
 	onClose() {
 		this.contentEl.empty();
+		// Dismissed without choosing — let the caller put the line back.
+		if (!this.picked) this.onCancel?.();
 	}
 }

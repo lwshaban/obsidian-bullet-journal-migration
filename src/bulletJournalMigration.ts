@@ -14,7 +14,9 @@ import {
 	getBulletMarker,
 	getIndentLevel,
 	removeMetadata,
-	collectChildTasks,} from './utils';
+	collectChildTasks,
+	sanitizeAncestorContext,
+	clampIndent,} from './utils';
 import { locateTaskLine, descendantLines, ancestorLines } from './locate';
 import { resolveRelativeMarker } from './markers';
 import { computeRecurrence, RecurUnit } from './recurrence';
@@ -88,7 +90,7 @@ export class BulletJournalMigration {
     parseMigrationMarker(line: string): MigrationMarker | null {
         // Check for information point marker [-> (migrates as plain list item, no [>] marker)
         // Syntax: - [->w], - [->m], - [->fri], etc. (dash before arrow, in checkbox position)
-        const infoPointMatch = line.match(/^\s*-\s*\[->(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})\]/i);
+        const infoPointMatch = line.match(/^\s*-\s*\[->(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})\s*\]/i);
         if (infoPointMatch && infoPointMatch[1]) {
             return {
                 marker: infoPointMatch[1].toLowerCase(),
@@ -107,7 +109,7 @@ export class BulletJournalMigration {
         // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
         // Note: (...) for source is ignored for new tasks (no source to update)
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i);
+        const newTaskMatch = line.match(/^\s*-\s*\[\+>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\s*\]/i);
         if (newTaskMatch && newTaskMatch[1]) {
             const destCheckboxContent = newTaskMatch[3] || null;  // {...} for destination
             return {
@@ -121,7 +123,7 @@ export class BulletJournalMigration {
         }
 
         // Check for delete marker (remove from source, don't migrate)
-        const deleteMatch = line.match(/^\s*-\s*\[d\]/i);
+        const deleteMatch = line.match(/^\s*-\s*\[d\s*\]/i);
         if (deleteMatch) {
             return {
                 marker: 'delete',
@@ -131,7 +133,7 @@ export class BulletJournalMigration {
         }
 
         // Check for skip marker (mark as migrated without migrating)
-        const skipMatch = line.match(/^\s*-\s*\[>(skip|x)\]/i);
+        const skipMatch = line.match(/^\s*-\s*\[>(skip|x)\s*\]/i);
         if (skipMatch) {
             return {
                 marker: 'skip',
@@ -143,7 +145,7 @@ export class BulletJournalMigration {
         // Check for current time period markers (must come before [<] check)
         // New syntax: [>:w], [>|w], [>:m], [>|m], [>:y], [>|y]
         // Legacy syntax: [<w], [<m], [<y]
-        const currentPeriodMatch = line.match(/^\s*-\s*\[(?:>(:|\|)(w|m|y)|<(w|m|y))\]/i);
+        const currentPeriodMatch = line.match(/^\s*-\s*\[(?:>(:|\|)(w|m|y)|<(w|m|y))\s*\]/i);
         if (currentPeriodMatch) {
             // Check which syntax was used
             if (currentPeriodMatch[1] && currentPeriodMatch[2]) {
@@ -167,7 +169,7 @@ export class BulletJournalMigration {
         }
 
         // Check for already-scheduled marker [<] (for marking as scheduled without migrating)
-        const scheduledMatch = line.match(/^\s*-\s*\[<\]/);
+        const scheduledMatch = line.match(/^\s*-\s*\[<\s*\]/);
         if (scheduledMatch) {
             return {
                 marker: 'scheduled',
@@ -177,7 +179,7 @@ export class BulletJournalMigration {
         }
 
         // Check for [>-] marker (mark as migrated without migrating, like [>skip])
-        const markWithoutMigrateMatch = line.match(/^\s*-\s*\[>-\]/);
+        const markWithoutMigrateMatch = line.match(/^\s*-\s*\[>-\s*\]/);
         if (markWithoutMigrateMatch) {
             return {
                 marker: 'skip',
@@ -187,7 +189,7 @@ export class BulletJournalMigration {
         }
 
         // Check for [>] marker - ignore it (don't process, leave as-is)
-        const ignoreMatch = line.match(/^\s*-\s*\[>\]/);
+        const ignoreMatch = line.match(/^\s*-\s*\[>\s*\]/);
         if (ignoreMatch) {
             return null; // Return null so it's not processed
         }
@@ -200,7 +202,7 @@ export class BulletJournalMigration {
         // Support destination checkbox: {o}, {a}, {.}, {=}, etc. - becomes destination checkbox
         // Example: [>w(/){=}] - source becomes [/], destination becomes [=]
         // Note: w\d* matches both 'w' (next week) and 'w1', 'w2', etc. (numbered weeks)
-        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\]/i;
+        const markerRegex = /^\s*-\s*\[>(>|:|\||:w|\|w|:m|\|m|:y|\|y|w\d*|m\d+w|m|<w|<m|<y|mon|tue|tues|wed|thu|thurs|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|fut|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2}|\d{4}-\d{2})(?:\(([^)]+)\))?(?:\{([^}]+)\})?\s*\]/i;
         const match = line.match(markerRegex);
 
         if (!match || !match[1]) {
@@ -528,7 +530,13 @@ export class BulletJournalMigration {
      */
     async appendToFile(filePath: string, taskLineOrLines: string | string[], monthName: string | null = null): Promise<void> {
         // Normalize to array - if single line, wrap in array
-        const taskLines = Array.isArray(taskLineOrLines) ? taskLineOrLines : [taskLineOrLines];
+        const requested = Array.isArray(taskLineOrLines) ? taskLineOrLines : [taskLineOrLines];
+        // Every write funnels through here, so this is the one place that can
+        // guarantee we never commit pathological nesting to a note.
+        const taskLines = clampIndent(requested);
+        if (taskLines.some((l, i) => l !== requested[i])) {
+            log.warn(`Clamped over-indented line(s) before writing to ${filePath}`);
+        }
         const taskLine = taskLines[0];
         if (!taskLine) {
             throw new Error('No task line provided to append');
@@ -1079,11 +1087,20 @@ export class BulletJournalMigration {
                 }
             }
 
-            return ancestorIdx
+            const texts = ancestorIdx
                 .map(n => lines[n])
                 .filter((l): l is string => l !== undefined && this.isBulletItem(l))
                 .map(l => this.removeMetadata(this.getTaskText(l)).trim())
                 .filter(text => text.length > 0);
+
+            // Never hand back a chain that would nest the task under itself or
+            // repeat a parent — those write a staircase that grows every run.
+            const ownText = this.removeMetadata(this.getTaskText(taskLine));
+            const safe = sanitizeAncestorContext(texts, ownText);
+            if (safe.length !== texts.length) {
+                log.warn(`Discarded ${texts.length - safe.length} unusable ancestor(s) for "${ownText.substring(0, 50)}" in ${sourceFilePath}`);
+            }
+            return safe;
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             log.error(`Error collecting ancestor context: ${errorMessage}`);
