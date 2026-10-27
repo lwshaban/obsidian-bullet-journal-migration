@@ -116,6 +116,21 @@ export function resolveRelativeMarker(code: string, anchor: moment.Moment): Dest
 	return null;
 }
 
+/**
+ * Does a destination match what the user has typed?
+ *
+ * Matching on a word's start rather than anywhere in the label is what turns
+ * the flat list into a drill-down: "w" narrows to the week rows instead of
+ * also dragging in "Tomorrow", which merely ends in a w. So "w" is the week
+ * sub-level and "m" the month one, with no nested menu to walk.
+ */
+export function matchesQuery(code: string, label: string, query: string): boolean {
+	if (!query) return true;
+	const needle = query.toLowerCase();
+	if (code.toLowerCase().startsWith(needle)) return true;
+	return label.toLowerCase().split(/[^a-z0-9]+/).some(word => word.startsWith(needle));
+}
+
 /** A short human label + resolved-date sub-label for a code, for UI previews. */
 export function describeMarker(code: string, anchor: moment.Moment): { label: string; sub: string } | null {
 	const resolved = resolveRelativeMarker(code, anchor);

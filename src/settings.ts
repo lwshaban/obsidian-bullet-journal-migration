@@ -10,6 +10,8 @@ export interface BujoPluginSettings {
 	futureLogPath: string;
 	reviewsPath: string;
 	templatesPath: string;
+	/** Show the destination picker when a marker is started in the editor. */
+	destinationPicker: boolean;
 	debugLogging: boolean;
 	/** Jump to the next task after a marker is applied. */
 	autoAdvance: boolean;
@@ -25,6 +27,7 @@ export const DEFAULT_SETTINGS: BujoPluginSettings = {
 	futureLogPath: 'Journal/006 Future Log',
 	reviewsPath: 'Journal/Bujo Reviews',
 	templatesPath: 'Obsidian/Templator/Journal',
+	destinationPicker: true,
 	debugLogging: false,
 	autoAdvance: true,
 	advanceOpensPicker: true,

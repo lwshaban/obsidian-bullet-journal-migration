@@ -51,6 +51,16 @@ export class BujoSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName('Keyboard').setHeading();
 
 		new Setting(containerEl)
+			.setName('Destination picker')
+			.setDesc('Show the popup when you start a marker with "[>". Turning it off leaves the marker codes to be typed by hand, and the keyboard triage commands will mark a task without offering a destination.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.destinationPicker)
+				.onChange(async (value) => {
+					this.plugin.settings.destinationPicker = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
 			.setName('Advance after marking')
 			.setDesc('After a migration marker is applied, jump to the next task in the note.')
 			.addToggle(toggle => toggle

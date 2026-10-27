@@ -385,3 +385,31 @@ body:not(.tasks) li[data-task="H"].task-list-item.is-checked {
 	line-height: 1.5;
 	text-align: center;
 }
+
+/* The destination list tops out at seven rows plus four headings, so it is
+   allowed to be taller than Obsidian's default suggester before it scrolls.
+   Scoped to this popup via the class added in renderSuggestion — the container
+   is shared with every other suggester in the app.
+
+   !important is load-bearing: Obsidian sets max-height inline on the container
+   while positioning the popup, and an inline style wins over a class. */
+.suggestion-container.bujo-suggest,
+.suggestion-container.bujo-suggest .suggestion {
+	max-height: 32em !important;
+}
+
+/* Day / Week / Month headings in the destination list. Inserted as siblings of
+   the rows, so they are inert: not selectable and skipped by the arrow keys. */
+.bujo-suggest-group {
+	padding: var(--size-2-2) var(--size-4-3) var(--size-2-1);
+	color: var(--text-faint);
+	font-size: var(--font-smallest);
+	font-weight: var(--font-semibold);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.bujo-suggest-group:not(:first-child) {
+	margin-top: var(--size-2-1);
+	border-top: 1px solid var(--background-modifier-border);
+}

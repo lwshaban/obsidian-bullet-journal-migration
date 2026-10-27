@@ -264,8 +264,10 @@ export class BulletJournalMigration {
     /**
      * Calculate destination date for migration marker
      */
-    calculateDestinationDate(marker: string, sourceDate: string, periodType: PeriodType = 'daily'): DestinationDate | null {
-        const sourceMoment = moment(sourceDate, 'YYYY-MM-DD');
+    calculateDestinationDate(marker: string, _sourceDate: string, periodType: PeriodType = 'daily'): DestinationDate | null {
+        // sourceDate is kept in the signature for callers, but no longer steers
+        // resolution: every marker now resolves from today. See the anchor
+        // comment below.
         const today = moment().startOf('day');
 
         // Explicit destinations (from the date picker or typed directly)
@@ -330,10 +332,17 @@ export class BulletJournalMigration {
         }
 
         // Forward/relative markers (>>, w, wN, m, mNw, weekdays, months, fut)
-        // are anchored on the note's own date, not today: [>w] in a 2026-W31
-        // note resolves to W32. Shared with the editor suggester's preview so
-        // the popup and "Process" never disagree.
-        const anchor = sourceMoment.isValid() ? sourceMoment.clone().startOf('day') : today.clone();
+        // resolve from today, not from the note they were written in.
+        //
+        // These markers are applied during review, where the source note is
+        // usually days or weeks old. Anchoring on the note meant "[>>]" in a
+        // note from last Tuesday resolved to last Wednesday — migrating a task
+        // into the past, where it would never be seen again. "Next week" has
+        // to mean the week after the one you are sitting in.
+        //
+        // Shared with the editor suggester's preview so the popup and
+        // "Process" can never disagree.
+        const anchor = today.clone();
         const relative = resolveRelativeMarker(marker, anchor);
         if (relative) {
             return relative;

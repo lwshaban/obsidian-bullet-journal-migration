@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { moment } from 'obsidian';
 
-import { resolveRelativeMarker, describeMarker } from '../src/markers';
+import { resolveRelativeMarker, describeMarker, matchesQuery } from '../src/markers';
 
 // A Thursday, so "next occurrence of X" has a non-trivial answer in both
 // directions, and ISO week 3 of 2026.
@@ -137,4 +137,32 @@ test('describeMarker previews the resolved destination', () => {
 		sub: 'future log',
 	});
 	assert.equal(describeMarker('nonsense', anchor()), null);
+});
+
+// ── Query matching (the picker's drill-down) ──────────────────────────────────
+
+test('"w" narrows to the week destinations, not everything containing a w', () => {
+	assert.ok(matchesQuery('w', 'Next week', 'w'));
+	assert.ok(matchesQuery(':w', 'This week', 'w'));
+	// "Tomorrow" ends in a w; a substring match would wrongly keep it.
+	assert.ok(!matchesQuery('>', 'Tomorrow', 'w'));
+	assert.ok(!matchesQuery(':', 'Today', 'w'));
+});
+
+test('"m" narrows to the month destinations', () => {
+	assert.ok(matchesQuery('m', 'Next month', 'm'));
+	assert.ok(matchesQuery(':m', 'This month', 'm'));
+	assert.ok(!matchesQuery('>', 'Tomorrow', 'm'));
+});
+
+test('matchesQuery matches on the code as well as the label', () => {
+	// Codes are what a user types from memory: ":w", "w2", "mon".
+	assert.ok(matchesQuery(':w', 'This week', ':'));
+	assert.ok(matchesQuery('w2', 'Week after next', 'w2'));
+	assert.ok(!matchesQuery('w', 'Next week', 'z'));
+});
+
+test('an empty query matches everything', () => {
+	assert.ok(matchesQuery(':', 'Today', ''));
+	assert.ok(matchesQuery('__pick__', 'Pick a date…', ''));
 });

@@ -23,7 +23,7 @@ export default class BujoMigrationPlugin extends Plugin {
 		// Autocomplete for migration markers: type "[>" in a task line, or run
 		// "Mark task for migration". Advancing afterwards is driven from here
 		// so the suggester stays unaware of the keyboard flow.
-		this.suggest = new MigrationSuggest(this.app);
+		this.suggest = new MigrationSuggest(this.app, () => this.settings);
 		this.suggest.onApplied = (editor) => {
 			if (this.settings.autoAdvance) jumpToTask(editor, 1, this.jumpOptions());
 		};

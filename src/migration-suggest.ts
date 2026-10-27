@@ -15,12 +15,15 @@ import {
 	TFile,
 	moment,
 } from 'obsidian';
-import { describeMarker } from './markers';
+import { describeMarker, matchesQuery } from './markers';
+import type { BujoPluginSettings } from './settings';
 
 interface DestSuggestion {
 	label: string;
 	sub: string;
 	code: string; // bracket content after the ">" prefix, e.g. "w", "mon", "2026-07-30", "2026-W32"
+	/** Heading this row sits under. Omitted for rows that stand alone. */
+	group?: string;
 }
 
 const PICK_DATE = '__pick__';
@@ -29,44 +32,26 @@ const PICK_DATE = '__pick__';
 const QUICK_SELECT_MAX = 9;
 
 /**
- * Anchor date the relative markers resolve against — the note's own date when
- * it's a journal note (daily / weekly / monthly), otherwise today. So "next
- * week" in a 2026-W31 note previews (and migrates) as W32.
+ * The standing destinations, in frequency order. Every marker here resolves
+ * from today — "next week" is the week after this one, wherever the task was
+ * written. The current-period codes (":", ":w", ":m") are already today-based
+ * in the engine; the forward ones ("\u003e", "w", "m") are anchored on today by
+ * calculateDestinationDate.
  */
-function anchorFromFile(file: TFile | null): moment.Moment {
+function buildSuggestions(): DestSuggestion[] {
 	const today = moment().startOf('day');
-	if (!file) return today;
-	const name = file.basename;
+	const tomorrow = describeMarker('>', today);
+	const nextWeek = describeMarker('w', today);
+	const nextMonth = describeMarker('m', today);
 
-	if (/^\d{4}-\d{2}-\d{2}$/.test(name)) {
-		const m = moment(name, 'YYYY-MM-DD', true);
-		if (m.isValid()) return m;
-	}
-	const wk = name.match(/^(\d{4})-W(\d{2})$/i);
-	if (wk && wk[1] && wk[2]) {
-		const m = moment().isoWeekYear(parseInt(wk[1], 10)).isoWeek(parseInt(wk[2], 10)).startOf('isoWeek');
-		if (m.isValid()) return m;
-	}
-	if (/^\d{4}-\d{2}$/.test(name)) {
-		const m = moment(`${name}-01`, 'YYYY-MM-DD', true);
-		if (m.isValid()) return m.startOf('month');
-	}
-	return today;
-}
-
-function buildSuggestions(anchor: moment.Moment): DestSuggestion[] {
-	const tomorrow = describeMarker('>', anchor);
-	const nextWeek = describeMarker('w', anchor);
-	const nextMonth = describeMarker('m', anchor);
 	return [
-		// "Today" is always the literal today, not the anchor: pulling a task
-		// into the current day is the one destination that ignores which note
-		// you happen to be standing in. ":" is the engine's today marker.
-		{ label: 'Today', sub: moment().format('ddd, MMM D'), code: ':' },
-		{ label: 'Tomorrow', sub: tomorrow?.label ?? '', code: '>' },
-		{ label: 'Next week', sub: nextWeek?.sub ?? '', code: 'w' },
-		{ label: 'Next month', sub: nextMonth?.label ?? '', code: 'm' },
-		{ label: 'Pick a date…', sub: 'calendar · day / week / month', code: PICK_DATE },
+		{ group: 'Day', label: 'Today', sub: today.format('ddd, MMM D'), code: ':' },
+		{ group: 'Day', label: 'Tomorrow', sub: tomorrow?.label ?? '', code: '>' },
+		{ group: 'Week', label: 'This week', sub: today.clone().startOf('isoWeek').format('[W]WW · [starts] MMM D'), code: ':w' },
+		{ group: 'Week', label: 'Next week', sub: nextWeek?.sub ?? '', code: 'w' },
+		{ group: 'Month', label: 'This month', sub: today.format('MMMM YYYY'), code: ':m' },
+		{ group: 'Month', label: 'Next month', sub: nextMonth?.label ?? '', code: 'm' },
+		{ group: 'Custom', label: 'Pick a date…', sub: 'calendar · day / week / month', code: PICK_DATE },
 	];
 }
 
@@ -138,7 +123,7 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		this.undo(pending);
 	}
 
-	constructor(app: App) {
+	constructor(app: App, private settings: () => BujoPluginSettings) {
 		super(app);
 
 		// Alt+1…9 picks the nth entry. Bare digits are off limits: the query
@@ -159,6 +144,8 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 	}
 
 	onTrigger(cursor: EditorPosition, editor: Editor, _file: TFile | null): EditorSuggestTriggerInfo | null {
+		if (!this.settings().destinationPicker) return null;
+
 		const beforeCursor = editor.getLine(cursor.line).slice(0, cursor.ch);
 		// Only fire in checkbox position at the start of a bullet: "- [>", "- [+>", "- [->"
 		const match = beforeCursor.match(/^\s*-\s*\[([+-]?>)([^\]]*)$/);
@@ -174,15 +161,15 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 
 	getSuggestions(context: EditorSuggestContext): DestSuggestion[] {
 		const query = context.query.toLowerCase();
-		const anchor = anchorFromFile(context.file);
+		const anchor = moment().startOf('day');
 
 		const explicit = explicitSuggestion(query);
 		if (explicit) return this.remember([explicit]);
 
-		const all = buildSuggestions(anchor);
+		const all = buildSuggestions();
 		if (!query) return this.remember(all);
 
-		const filtered = all.filter(s => s.code.startsWith(query) || s.label.toLowerCase().includes(query));
+		const filtered = all.filter(s => matchesQuery(s.code, s.label, query));
 
 		// Progressive: if the typed code resolves as a relative marker that isn't
 		// already one of the base entries (e.g. "w2", "mon", "m3w", "aug"), show
@@ -222,6 +209,17 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		return this.numbered()[parseInt(digit[1], 10) - 1];
 	}
 
+	/**
+	 * The heading to draw above a row, or null. Only the first row of a run
+	 * carries it, and a filtered list that has lost the rest of its group
+	 * simply shows no heading.
+	 */
+	private groupFor(item: DestSuggestion): string | null {
+		if (!item.group) return null;
+		const first = this.shown.find(s => s.group === item.group);
+		return first === item ? item.group : null;
+	}
+
 	/** The accelerator shown on the left of a row: "1".."9", or "D" for the calendar. */
 	private badgeFor(item: DestSuggestion): string | null {
 		if (item.code === PICK_DATE) return 'D';
@@ -231,6 +229,22 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 
 	renderSuggestion(item: DestSuggestion, el: HTMLElement): void {
 		el.addClass('mod-complex');
+
+		// Tag the popup itself so its height can be raised without touching
+		// every other suggester in the app. The container is shared chrome, so
+		// this is the only hook we get from inside a row.
+		el.closest('.suggestion-container')?.addClass('bujo-suggest');
+
+		// Headings go in as siblings rather than inside the row: the suggester
+		// navigates its own array of items, so an extra node between them is
+		// inert — it can't be selected, hovered into, or arrowed onto.
+		const group = this.groupFor(item);
+		if (group) {
+			const header = el.doc.createElement('div');
+			header.addClass('bujo-suggest-group');
+			header.setText(group);
+			el.insertAdjacentElement('beforebegin', header);
+		}
 
 		const badge = this.badgeFor(item);
 		if (badge) el.createDiv({ cls: 'bujo-suggest-index', text: badge });
