@@ -198,11 +198,16 @@ Opens a short list — pick one and it generates:
 
 | Row | What it does |
 |---|---|
-| **Week** | last week, or the week of the note you're in |
-| **Month** | last month, or the month of the note you're in |
+| **This week** / **Last week** | each labelled with the week it resolves to |
+| **This month** / **Last month** | each labelled with the month |
 | **Global** | every journal note whose period has passed |
 | **Between dates…** | any from→to range, up to 1000 days |
 | **More options…** | the full form: period *and* which entries to list |
+
+Both periods are offered rather than one guessed from the date or from the note
+you have open — the row you want is always in the same place, and says which
+month or week it means. The form behind **More options…** does pre-fill from the
+note you are in, where you can see and change it.
 
 The form adds one more choice — **Include**:
 

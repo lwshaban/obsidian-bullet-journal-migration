@@ -75,27 +75,46 @@ export class ReviewQuickPick extends SuggestModal<ReviewChoice> {
 	}
 
 	/**
-	 * Presets follow the note you are in: from 2026-10.md the month row offers
-	 * October, not last month. Same rule as the form (see adoptActiveNote).
+	 * Fixed rows, in a fixed order. An earlier version inferred one month from
+	 * the note you had open and fell back to "last month" otherwise, which
+	 * meant the row said October on the 13th of November — defensible, and
+	 * still wrong every time you ran it from anywhere but a journal note.
+	 * Both periods are offered instead, each labelled with the month or week
+	 * it resolves to, so there is nothing to infer and the row you want is
+	 * always in the same place. The form behind "More options…" still
+	 * pre-fills from the note you are in, where the value is visible and
+	 * editable.
 	 */
 	private choices(): ReviewChoice[] {
-		const form = () => new GenerateReviewModal(this.app, this.generate);
 		const plain = (scope: ReviewScope) => this.generate({ scope, include: { ...OUTSTANDING_ONLY } });
+		const week = (m: moment.Moment): ReviewChoice['sub'] =>
+			`${m.format('[W]WW')} · starts ${m.clone().startOf('isoWeek').format('MMM D')}`;
 
-		const defaults = periodDefaults(this.app);
-		const month = moment(defaults.month, 'YYYY-MM');
-		const week = moment(defaults.week, 'GGGG-[W]WW');
+		const thisWeek = moment();
+		const lastWeek = moment().subtract(1, 'week');
+		const thisMonth = moment();
+		const lastMonth = moment().subtract(1, 'month');
 
 		return [
 			{
-				title: 'Week',
-				sub: `${week.format('[W]WW')} · starts ${week.clone().startOf('isoWeek').format('MMM D')}`,
-				run: () => void plain({ kind: 'weekly', week: defaults.week }),
+				title: 'This week',
+				sub: week(thisWeek),
+				run: () => void plain({ kind: 'weekly', week: thisWeek.format('GGGG-[W]WW') }),
 			},
 			{
-				title: 'Month',
-				sub: month.format('MMMM YYYY'),
-				run: () => void plain({ kind: 'monthly', month: defaults.month }),
+				title: 'Last week',
+				sub: week(lastWeek),
+				run: () => void plain({ kind: 'weekly', week: lastWeek.format('GGGG-[W]WW') }),
+			},
+			{
+				title: 'This month',
+				sub: thisMonth.format('MMMM YYYY'),
+				run: () => void plain({ kind: 'monthly', month: thisMonth.format('YYYY-MM') }),
+			},
+			{
+				title: 'Last month',
+				sub: lastMonth.format('MMMM YYYY'),
+				run: () => void plain({ kind: 'monthly', month: lastMonth.format('YYYY-MM') }),
 			},
 			{
 				title: 'Global',
@@ -105,12 +124,12 @@ export class ReviewQuickPick extends SuggestModal<ReviewChoice> {
 			{
 				title: 'Between dates…',
 				sub: 'any from → to range',
-				run: () => form().openAt('range'),
+				run: () => new GenerateReviewModal(this.app, this.generate).openAt('range'),
 			},
 			{
 				title: 'More options…',
 				sub: 'choose the period and which entries to list',
-				run: () => form().open(),
+				run: () => new GenerateReviewModal(this.app, this.generate).open(),
 			},
 		];
 	}
