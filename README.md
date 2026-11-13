@@ -219,8 +219,8 @@ Two things are left out:
 - **Frontmatter.** A note's `tags:` and `aliases:` are YAML list items — bullets,
   as far as a text scan is concerned — so they are skipped rather than listed as
   things to triage.
-- **Entries over 1000 characters**, which are held back with a note in the review
-  saying how many and why. Almost always this is an image pasted straight into a
+- **Entries over 5000 characters** (about 800 words), which are held back with a
+  note in the review saying how many and why. Almost always this is an image pasted straight into a
   note: Obsidian stores it inline as base64, so one bullet becomes a few hundred
   kilobytes of text, and a single line that long makes the review unusable to
   type in — the editor re-renders it on every keystroke. The entry stays

@@ -41,18 +41,25 @@ export interface AppendResult {
 }
 
 /**
- * Longest line a review will list.
+ * Longest line a review will list — about 800 words, far more than anyone
+ * writes in a single bullet.
  *
- * A journal entry is a sentence or two. A line past this is pasted content — an
- * embedded data URI, a transcript — and putting one in a review makes the whole
- * note unusable: CodeMirror re-tokenizes a line on every keystroke, so a single
- * 240KB bullet costs seconds per character typed.
+ * This exists to keep pasted content out, not to ration prose. An image pasted
+ * into a note is stored inline as base64, so one screenshot is a few hundred
+ * kilobytes on a single line, and CodeMirror re-tokenizes a line on every
+ * keystroke — one such bullet costs seconds per character typed in the review.
+ *
+ * The gap between the two populations is enormous (in a real 900-note journal:
+ * longest written entry ~1,100 characters, one pasted image at ~244,000, and
+ * nothing in between), so the threshold only has to land inside it. Sitting
+ * well above any written entry means a real one is never held back, and still
+ * two orders of magnitude below the case that hurts.
  *
  * Held back rather than shortened: processing locates a task by matching its
  * text, so a truncated copy could never be acted on, and silently rewriting
  * someone's note content is worse than omitting it.
  */
-export const MAX_REVIEW_LINE = 1000;
+export const MAX_REVIEW_LINE = 5000;
 
 /**
  * A base64 data URI — a pasted image stored inline as text rather than as a
