@@ -214,10 +214,17 @@ The form adds one more choice — **Include**:
 information points are journal entries too, and a review that hides them isn't a
 review.
 
-One exception: an entry longer than **1000 characters** is held back and the
-review says so. That length is pasted content rather than a journal entry, and
-a single very long line makes the whole review unusable to type in — the editor
-re-renders it on every keystroke. The entry stays untouched in its own note.
+Two things are left out:
+
+- **Frontmatter.** A note's `tags:` and `aliases:` are YAML list items — bullets,
+  as far as a text scan is concerned — so they are skipped rather than listed as
+  things to triage.
+- **Entries over 1000 characters**, which are held back with a note in the review
+  saying how many and why. Almost always this is an image pasted straight into a
+  note: Obsidian stores it inline as base64, so one bullet becomes a few hundred
+  kilobytes of text, and a single line that long makes the review unusable to
+  type in — the editor re-renders it on every keystroke. The entry stays
+  untouched in its own note.
 
 **Already filed** is the way back to a task whose migration didn't land where you
 expected: a normal review treats `[>]` as settled and will never show it again.

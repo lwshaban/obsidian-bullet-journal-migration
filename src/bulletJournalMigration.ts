@@ -54,9 +54,35 @@ export interface AppendResult {
  */
 export const MAX_REVIEW_LINE = 1000;
 
+/**
+ * A base64 data URI — a pasted image stored inline as text rather than as a
+ * file. One screenshot is a few hundred kilobytes on a single line, which is
+ * the usual reason an entry is too big to put in a review.
+ */
+const EMBEDDED_DATA = /data:[^;,\s]*;base64,/i;
+
 /** What a collection pass held back, for the review to report. */
 export interface CollectStats {
 	oversized: number;
+	/** Of those, how many were oversized because of an embedded image. */
+	embedded: number;
+}
+
+/**
+ * A note's body, with YAML frontmatter removed.
+ *
+ * Frontmatter list items are bullets too — `  - BulletJournal` under `tags:` —
+ * so anything that collects every bullet in a file collects the note's tags as
+ * if they were journal entries. Only a `---` on the very first line opens
+ * frontmatter, and only a matching `---` closes it; an unterminated one is not
+ * frontmatter at all, so the whole file stays body.
+ */
+export function bodyLines(content: string): string[] {
+	const lines = content.split('\n');
+	if (lines.length === 0 || lines[0]?.trim() !== '---') return lines;
+
+	const end = lines.findIndex((line, i) => i > 0 && line.trim() === '---');
+	return end === -1 ? lines : lines.slice(end + 1);
 }
 
 /** The slice of Templater's plugin instance this code calls into. */
@@ -542,14 +568,18 @@ export class BulletJournalMigration {
         if (!file || !(file instanceof TFile)) return [];
 
         const content = await this.app.vault.read(file);
-        const lines = content.split('\n');
-        return lines.filter(line => {
+        return bodyLines(content).filter(line => {
             const group = this.classifyTaskState(line);
             if (group === null || !include[group]) return false;
 
             if (line.length > MAX_REVIEW_LINE) {
-                log.warn(`Held a ${line.length}-character entry out of the review: ${filePath}`);
-                if (stats) stats.oversized++;
+                const embedded = EMBEDDED_DATA.test(line);
+                log.warn(`Held a ${line.length}-character entry out of the review`
+                    + `${embedded ? ' (embedded image)' : ''}: ${filePath}`);
+                if (stats) {
+                    stats.oversized++;
+                    if (embedded) stats.embedded++;
+                }
                 return false;
             }
             return true;

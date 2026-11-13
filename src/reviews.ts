@@ -129,12 +129,19 @@ async function collectBySource(
 function oversizedNote(stats: CollectStats): string[] {
 	if (stats.oversized === 0) return [];
 	const n = stats.oversized;
+	const it = n === 1 ? 'It' : 'They';
+	const cause = stats.embedded === n
+		? `${it} ${n === 1 ? 'contains' : 'contain'} an image pasted inline, which is stored as text —`
+			+ ' often a few hundred kilobytes on one line.'
+		: `${it} ${n === 1 ? 'is' : 'are'} over ${MAX_REVIEW_LINE} characters`
+			+ `${stats.embedded > 0 ? `, and ${stats.embedded} of them hold an inline image` : ''}.`;
+
 	return [
 		'',
-		`> [!warning] ${n} ${n === 1 ? 'entry was' : 'entries were'} too long to list`,
-		`> ${n === 1 ? 'It is' : 'They are'} over ${MAX_REVIEW_LINE} characters — pasted content rather than a journal entry.`,
-		`> ${n === 1 ? 'It has' : 'They have'} been left untouched in ${n === 1 ? 'its' : 'their'} own note. A line that long makes a review`,
-		'> unusable to type in, so it is held back rather than copied here.',
+		`> [!warning] ${n} ${n === 1 ? 'entry was' : 'entries were'} too big to list`,
+		`> ${cause}`,
+		`> ${it} ${n === 1 ? 'has' : 'have'} been left untouched in ${n === 1 ? 'its' : 'their'} own note: a line that long`,
+		'> makes a review unusable to type in, so it is held back rather than copied here.',
 	];
 }
 
@@ -307,7 +314,7 @@ export async function generateReview(bujo: BulletJournalMigration, request: Revi
 		}
 
 		new Notice('Generating review...');
-		const stats: CollectStats = { oversized: 0 };
+		const stats: CollectStats = { oversized: 0, embedded: 0 };
 		const bySource = await collectBySource(bujo, notePaths, include, stats);
 		await writeReview(bujo, kind, reviewPath, renderGrouped(title, bySource, include, emptyNote, stats));
 
@@ -370,7 +377,7 @@ export async function generateGlobalReview(bujo: BulletJournalMigration, include
 		const sections: Record<string, { path: string; tasks: string[] }[]> = {
 			'Daily Notes': [], 'Weekly Notes': [], 'Monthly Notes': [],
 		};
-		const stats: CollectStats = { oversized: 0 };
+		const stats: CollectStats = { oversized: 0, embedded: 0 };
 		let total = 0;
 
 		for (const file of journalFiles) {

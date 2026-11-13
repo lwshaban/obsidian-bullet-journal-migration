@@ -102,6 +102,50 @@ test('every entry falls in exactly one group', () => {
 	assert.equal(bujo.classifyTaskState('-'), null);
 });
 
+test('frontmatter tags are not journal entries', async () => {
+	// `  - BulletJournal` under `tags:` is a bullet, so collecting every bullet
+	// in a file listed every note's tags as if they were things to triage.
+	const path = `${DAILY}/2026-10-30.md`;
+	const { bujo } = setup({
+		[path]: [
+			'---',
+			'tags:',
+			'  - Journal/DailyNote',
+			'  - BulletJournal',
+			'aliases:',
+			'  - Oct 30',
+			'---',
+			'',
+			'## Notes',
+			'- [ ] A real task',
+			'- A real information point',
+			'',
+		].join('\n'),
+	});
+
+	assert.deepEqual(await bujo.collectTasks(path, include()), [
+		'- [ ] A real task',
+		'- A real information point',
+	]);
+});
+
+test('a body "---" rule does not swallow the note', async () => {
+	// Only a delimiter on line 1 opens frontmatter; a horizontal rule further
+	// down is just a rule, and an unterminated one is not frontmatter at all.
+	const { bujo } = setup({
+		[`${DAILY}/2026-10-30.md`]: ['## Notes', '- [ ] Above the rule', '---', '- [ ] Below the rule', ''].join('\n'),
+		[`${DAILY}/2026-10-31.md`]: ['---', '- [ ] No closing delimiter', ''].join('\n'),
+	});
+
+	assert.deepEqual(await bujo.collectTasks(`${DAILY}/2026-10-30.md`, include()), [
+		'- [ ] Above the rule',
+		'- [ ] Below the rule',
+	]);
+	assert.deepEqual(await bujo.collectTasks(`${DAILY}/2026-10-31.md`, include()), [
+		'- [ ] No closing delimiter',
+	]);
+});
+
 test('an entry too long to type beside is held back, not copied in', async () => {
 	// A single 240KB bullet (a pasted data URI) made a generated review take
 	// seconds per keystroke: CodeMirror re-tokenizes the whole line on each
@@ -113,7 +157,7 @@ test('an entry too long to type beside is held back, not copied in', async () =>
 		[path]: ['## Notes', '- [ ] Normal task', huge, ''].join('\n'),
 	});
 
-	const stats = { oversized: 0 };
+	const stats = { oversized: 0, embedded: 0 };
 	assert.deepEqual(await bujo.collectTasks(path, include(), stats), ['- [ ] Normal task']);
 	assert.equal(stats.oversized, 1);
 });
@@ -126,7 +170,7 @@ test('an entry right at the limit is still listed', async () => {
 
 	const { bujo } = setup({ [path]: ['## Notes', exact, ''].join('\n') });
 
-	const stats = { oversized: 0 };
+	const stats = { oversized: 0, embedded: 0 };
 	assert.deepEqual(await bujo.collectTasks(path, include(), stats), [exact]);
 	assert.equal(stats.oversized, 0);
 });
@@ -146,7 +190,7 @@ test('a review says what it held back', async () => {
 	const review = vault.files.get(`${REVIEWS}/Monthly/2026-10-Review.md`) ?? '';
 	assert.ok(review.includes('- [ ] Normal task'));
 	assert.ok(!review.includes('zzz'), 'the oversized entry is not copied in');
-	assert.match(review, /1 entry was too long to list/);
+	assert.match(review, /1 entry was too big to list/);
 	// A silent omission is the same failure as a silently dropped migration
 	assert.match(review, new RegExp(`over ${MAX_REVIEW_LINE} characters`));
 });
@@ -337,4 +381,24 @@ test('a review is kept when something in it fails', async () => {
 
 	assert.deepEqual(trashed, [], 'the review survives as the record of what is outstanding');
 	assert.ok(vault.files.has(reviewPath));
+});
+
+test('a pasted image is named as the cause, not just "too long"', async () => {
+	// The real case: a screenshot pasted into a daily note is stored inline as
+	// base64, so one bullet is a few hundred kilobytes of text.
+	const { bujo, vault } = setup({
+		[`${DAILY}/2026-10-30.md`]: [
+			'## Notes',
+			'- [ ] Normal task',
+			`- ![](data:image/png;base64,${'A'.repeat(MAX_REVIEW_LINE)})`,
+			'',
+		].join('\n'),
+	});
+
+	await bujo.generateReview({ scope: { kind: 'monthly', month: '2026-10' }, include: include() });
+
+	const review = vault.files.get(`${REVIEWS}/Monthly/2026-10-Review.md`) ?? '';
+	assert.ok(!review.includes('base64'), 'the data URI never reaches the review');
+	assert.match(review, /image pasted inline/);
+	assert.ok(review.includes('- [ ] Normal task'));
 });
