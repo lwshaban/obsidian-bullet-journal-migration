@@ -289,3 +289,47 @@ test('a recovered [>] task can be re-migrated from a review', async () => {
 	assert.equal(result.success, true);
 	assert.ok(lines(DEST).includes('- [ ] Pay invoice'));
 });
+
+test('a batch of migrations arrives in the order it was marked up', async () => {
+	// Each task used to be inserted straight after the section heading, so the
+	// second landed above the first and a batch arrived upside down.
+	const { bujo, lines } = setup({
+		[SOURCE]: [
+			'## Notes',
+			'- [>2026-12-15] First',
+			'- [>2026-12-15] Second',
+			'- [>2026-12-15] Third',
+			'',
+		].join('\n'),
+		[DEST]: ['# 2026-12-15', '', '## Notes', '', '## Log', ''].join('\n'),
+	});
+
+	for (const task of ['First', 'Second', 'Third']) {
+		const result = await bujo.migrateTask(`- [>2026-12-15] ${task}`, SOURCE, '2026-10-30', 'daily');
+		assert.equal(result.success, true, task);
+	}
+
+	const body = lines(DEST);
+	assert.deepEqual(body.filter(l => l.startsWith('- ')), [
+		'- [ ] First',
+		'- [ ] Second',
+		'- [ ] Third',
+	]);
+	// …and inside the right section, not spilled into the one after it
+	assert.ok(body.indexOf('- [ ] Third') < body.indexOf('## Log'));
+});
+
+test('migrations join an existing list rather than jumping above it', async () => {
+	const { bujo, lines } = setup({
+		[SOURCE]: ['## Notes', '- [>2026-12-15] Newcomer', ''].join('\n'),
+		[DEST]: ['## Notes', '- [ ] Already here', '- [x] Done earlier', '', ''].join('\n'),
+	});
+
+	await bujo.migrateTask('- [>2026-12-15] Newcomer', SOURCE, '2026-10-30', 'daily');
+
+	assert.deepEqual(lines(DEST).filter(l => l.startsWith('- ')), [
+		'- [ ] Already here',
+		'- [x] Done earlier',
+		'- [ ] Newcomer',
+	]);
+});

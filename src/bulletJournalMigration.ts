@@ -548,13 +548,19 @@ export class BulletJournalMigration {
         const trimmed = line.trim();
         if (!this.isBulletItem(trimmed)) return null;
 
-        // An entry needs something to say: this filters out "---" rules and
-        // empty checkboxes. getTaskText alone won't do it — for "- [ ]" it
-        // falls through to its plain-bullet branch and reads the empty
-        // checkbox itself as the text.
-        const checkbox = trimmed.match(/^-\s*\[[^\]]+\]\s*(.*)$/);
-        const text = checkbox ? (checkbox[1] ?? '').trim() : this.getTaskText(trimmed);
-        if (!text) return null;
+        // An entry carries a checkbox. Tasks, events [o], appointments [a],
+        // in-progress [/] and scheduled [s] are all things you act on in a
+        // review; a plain "- note to self" is context, and it travels with
+        // whatever it sits under rather than being triaged on its own. Listing
+        // every loose bullet turned a review into a transcript of the month.
+        //
+        // To move a bare note deliberately, give it a marker — "- [->w] note"
+        // migrates it and keeps it a plain bullet at the destination.
+        const checkbox = trimmed.match(/^-\s*\[([^\]]+)\]\s*(.*)$/);
+        if (!checkbox) return null;
+
+        // An entry needs something to say, so "- [ ]" on its own is not one
+        if (!(checkbox[2] ?? '').trim()) return null;
 
         if (this.isCompletedTask(trimmed)) return 'completed';
         if (this.isDeletedTask(trimmed)) return 'cancelled';
@@ -786,9 +792,30 @@ export class BulletJournalMigration {
             // Look for the appropriate section (Plan for weekly/monthly, Notes for daily)
             const sectionIndex = lines.findIndex(line => line.trim() === sectionName);
             if (sectionIndex !== -1) {
-                // Insert right after the section heading (at the top of the section)
-                insertIndex = sectionIndex + 1;
-                log.debug(`Found ${sectionName} section at line ${sectionIndex}, inserting at ${insertIndex}`);
+                // Append to the END of the section, not the top. Inserting
+                // after the heading meant each task landed above the one
+                // migrated before it, so a batch arrived in reverse order —
+                // the list you read back was upside down relative to the one
+                // you marked up.
+                let sectionEnd = lines.length;
+                for (let i = sectionIndex + 1; i < lines.length; i++) {
+                    const current = lines[i];
+                    if (current === undefined) continue;
+                    const trimmed = current.trim();
+                    if (trimmed.startsWith('#') || trimmed === '---') {
+                        sectionEnd = i;
+                        break;
+                    }
+                }
+
+                // Back up over trailing blank lines so the task joins the list
+                // rather than sitting after a gap
+                while (sectionEnd > sectionIndex + 1 && (lines[sectionEnd - 1] ?? '').trim() === '') {
+                    sectionEnd--;
+                }
+
+                insertIndex = sectionEnd;
+                log.debug(`Found ${sectionName} section at line ${sectionIndex}, appending at ${insertIndex}`);
             } else {
                 log.debug(`${sectionName} section not found, appending to end of file`);
             }

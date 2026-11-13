@@ -59,8 +59,9 @@ test('a scope collects only the states it asks for', async () => {
 		'- [a] Appointment',
 		'- [/] In progress',
 		'- [>mon] Marked for Monday',
-		'- Information point',
 	]);
+	// A bare "- Information point" is context, not something to triage: it
+	// travels with whatever it sits under.
 
 	assert.deepEqual(await bujo.collectTasks(path, include({ completed: true, outstanding: false })), [
 		'- [x] Completed task',
@@ -81,9 +82,13 @@ test('every entry falls in exactly one group', () => {
 	const { bujo } = setup();
 
 	// Anything unfinished and unfiled is outstanding, whatever its checkbox
-	for (const line of ['- [ ] x', '- [s] x', '- [o] x', '- [a] x', '- [/] x', '- [!] x', '- plain bullet']) {
+	for (const line of ['- [ ] x', '- [s] x', '- [o] x', '- [a] x', '- [/] x', '- [!] x']) {
 		assert.equal(bujo.classifyTaskState(line), 'outstanding', line);
 	}
+	// A plain bullet is context, not an entry to triage on its own
+	assert.equal(bujo.classifyTaskState('- plain bullet'), null);
+	// …unless it is explicitly marked to move
+	assert.equal(bujo.classifyTaskState('- [->w] note to carry forward'), 'outstanding');
 	// [>mon] and [>-] are pending instructions, not filed tasks
 	assert.equal(bujo.classifyTaskState('- [>w] x'), 'outstanding');
 	assert.equal(bujo.classifyTaskState('- [>-] x'), 'outstanding');
@@ -100,6 +105,7 @@ test('every entry falls in exactly one group', () => {
 	assert.equal(bujo.classifyTaskState('just prose'), null);
 	assert.equal(bujo.classifyTaskState('- [ ]'), null);
 	assert.equal(bujo.classifyTaskState('-'), null);
+	assert.equal(bujo.classifyTaskState('- '), null);
 });
 
 test('frontmatter tags are not journal entries', async () => {
@@ -123,10 +129,7 @@ test('frontmatter tags are not journal entries', async () => {
 		].join('\n'),
 	});
 
-	assert.deepEqual(await bujo.collectTasks(path, include()), [
-		'- [ ] A real task',
-		'- A real information point',
-	]);
+	assert.deepEqual(await bujo.collectTasks(path, include()), ['- [ ] A real task']);
 });
 
 test('a body "---" rule does not swallow the note', async () => {
@@ -384,13 +387,14 @@ test('a review is kept when something in it fails', async () => {
 });
 
 test('a pasted image is named as the cause, not just "too long"', async () => {
-	// The real case: a screenshot pasted into a daily note is stored inline as
-	// base64, so one bullet is a few hundred kilobytes of text.
+	// A screenshot pasted into a note is stored inline as base64, so the line
+	// is a few hundred kilobytes. A bare "- ![](data:…)" is already excluded
+	// for being a plain bullet; this is the case where it rides on a task.
 	const { bujo, vault } = setup({
 		[`${DAILY}/2026-10-30.md`]: [
 			'## Notes',
 			'- [ ] Normal task',
-			`- ![](data:image/png;base64,${'A'.repeat(MAX_REVIEW_LINE)})`,
+			`- [ ] Sketch the layout ![](data:image/png;base64,${'A'.repeat(MAX_REVIEW_LINE)})`,
 			'',
 		].join('\n'),
 	});

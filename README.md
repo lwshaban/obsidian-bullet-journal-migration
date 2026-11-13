@@ -70,10 +70,13 @@ a template in the configured templates folder:
 template if you have it installed. With no matching template the note is simply
 created with the task in it, so templates are optional.
 
-Migrated tasks are inserted under a `## Plan` heading in weekly and monthly
-notes, `## Notes` in daily notes, and under the matching month heading (or
+Migrated tasks are added under a `## Plan` heading in weekly and monthly notes,
+`## Notes` in daily notes, and under the matching month heading (or
 `## General`) in the future log. Without those headings the task is appended to
 the end of the note.
+
+They go at the **end** of that section, so a batch arrives in the order you
+marked it up and joins any list already there.
 
 ## Quick Entry (Autocomplete)
 
@@ -210,11 +213,16 @@ The form adds one more choice — **Include**:
 | Completed | `[x]` | a retrospective: what actually got done |
 | Cancelled | `[-]` | what you dropped |
 
-**Outstanding is the whole page, not just tasks** — events, appointments and
-information points are journal entries too, and a review that hides them isn't a
-review.
+**Outstanding is more than tasks** — events `[o]`, appointments `[a]`,
+in-progress `[/]` and scheduled `[s]` are entries you act on in a review, so
+they are all listed.
 
-Two things are left out:
+**Plain bullets are not.** A bare `- note to self` is context, not something to
+triage: it travels with whatever task it sits under rather than appearing as its
+own line in the review. To move one deliberately, give it a marker —
+`- [->w] note` migrates it and keeps it a plain bullet at the destination.
+
+Also left out:
 
 - **Frontmatter.** A note's `tags:` and `aliases:` are YAML list items — bullets,
   as far as a text scan is concerned — so they are skipped rather than listed as
