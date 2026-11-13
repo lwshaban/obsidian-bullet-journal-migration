@@ -34,12 +34,21 @@ export interface MigrationResult {
  */
 export interface TaskInclusion {
 	/**
-	 * Everything still outstanding — not just `[ ]` and `[s]` but events `[o]`,
-	 * appointments `[a]`, any other checkbox state, plain information bullets,
-	 * and anything already carrying a migration marker. A bullet journal page
-	 * is not only tasks, and a review that hides half of it isn't a review.
+	 * Open work that can still move: `[ ]`, `[s]` scheduled, `[/]` in progress,
+	 * and anything already carrying a migration marker. This is what a review
+	 * is for, so it is the only group on by default.
 	 */
 	outstanding: boolean;
+	/**
+	 * Entries that belong to the day they happened — `[o]` events, `[a]`
+	 * appointments, `[i]` ideas, `[?]` questions and any other custom type.
+	 *
+	 * Separate from `outstanding` because "migrate to next week" does not mean
+	 * anything for a dinner that was on the 3rd. They are listed when you want
+	 * to read a period back, not when you are deciding what still has to be
+	 * done.
+	 */
+	timebound: boolean;
 	/** `[>]`, `[<]`, `[+]` — already filed. The recovery view. */
 	migrated: boolean;
 	/** `[x]` — for a retrospective rather than a triage list. */
@@ -50,6 +59,7 @@ export interface TaskInclusion {
 
 export const OUTSTANDING_ONLY: TaskInclusion = {
 	outstanding: true,
+	timebound: false,
 	migrated: false,
 	completed: false,
 	cancelled: false,

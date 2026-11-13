@@ -52,16 +52,21 @@ test('a scope collects only the states it asks for', async () => {
 
 	// Outstanding is the whole page, not just the ticked-box kind: events,
 	// appointments and information points are journal entries too.
+	// Open work by default: the kinds of entry that can still move
 	assert.deepEqual(await bujo.collectTasks(path, include()), [
 		'- [ ] Open task',
 		'- [s] Scheduled task',
-		'- [o] Event',
-		'- [a] Appointment',
 		'- [/] In progress',
 		'- [>mon] Marked for Monday',
 	]);
-	// A bare "- Information point" is context, not something to triage: it
+
+	// Events and appointments belong to the day they happened, so they are
+	// listed only when asked for. A bare "- Information point" is context and
 	// travels with whatever it sits under.
+	assert.deepEqual(await bujo.collectTasks(path, include({ timebound: true, outstanding: false })), [
+		'- [o] Event',
+		'- [a] Appointment',
+	]);
 
 	assert.deepEqual(await bujo.collectTasks(path, include({ completed: true, outstanding: false })), [
 		'- [x] Completed task',
@@ -81,10 +86,16 @@ test('a scope collects only the states it asks for', async () => {
 test('every entry falls in exactly one group', () => {
 	const { bujo } = setup();
 
-	// Anything unfinished and unfiled is outstanding, whatever its checkbox
-	for (const line of ['- [ ] x', '- [s] x', '- [o] x', '- [a] x', '- [/] x', '- [!] x']) {
+	// Open work: states a task can still move out of
+	for (const line of ['- [ ] x', '- [s] x', '- [/] x']) {
 		assert.equal(bujo.classifyTaskState(line), 'outstanding', line);
 	}
+	// Everything else with a checkbox describes a moment, not a job
+	for (const line of ['- [o] x', '- [a] x', '- [i] x', '- [?] x', '- [b] x', '- [=] x']) {
+		assert.equal(bujo.classifyTaskState(line), 'timebound', line);
+	}
+	// …but an explicit marker is an instruction to move it, whatever type it is
+	assert.equal(bujo.classifyTaskState('- [>fri] dinner moved'), 'outstanding');
 	// A plain bullet is context, not an entry to triage on its own
 	assert.equal(bujo.classifyTaskState('- plain bullet'), null);
 	// …unless it is explicitly marked to move
@@ -405,4 +416,33 @@ test('a pasted image is named as the cause, not just "too long"', async () => {
 	assert.ok(!review.includes('base64'), 'the data URI never reaches the review');
 	assert.match(review, /image pasted inline/);
 	assert.ok(review.includes('- [ ] Normal task'));
+});
+
+test('an event is left where it happened unless it is marked or asked for', async () => {
+	// "Migrate to next week" means nothing for a dinner that was on the 3rd,
+	// so events stay put — but marking one is an explicit instruction to move
+	// it, and that has to reach the review that will process it.
+	const path = `${DAILY}/2026-10-30.md`;
+	const { bujo } = setup({
+		[path]: [
+			'## Notes',
+			'- [ ] Book the table',
+			'- [o] Dinner with Sam',
+			'- [>fri] Dentist, moved',
+			'- [a] Standup 9am',
+			'',
+		].join('\n'),
+	});
+
+	assert.deepEqual(await bujo.collectTasks(path, include()), [
+		'- [ ] Book the table',
+		'- [>fri] Dentist, moved',
+	]);
+
+	assert.deepEqual(await bujo.collectTasks(path, include({ timebound: true })), [
+		'- [ ] Book the table',
+		'- [o] Dinner with Sam',
+		'- [>fri] Dentist, moved',
+		'- [a] Standup 9am',
+	]);
 });

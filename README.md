@@ -208,19 +208,24 @@ The form adds one more choice — **Include**:
 
 | Toggle | Entries | Use |
 |---|---|---|
-| Outstanding | `[ ]` `[s]` `[o]` `[a]` `[/]`, information bullets, anything already marked | the normal review; on by default |
+| Open work | `[ ]` `[s]` `[/]`, and anything already carrying a marker | the normal review; on by default |
+| Events and the like | `[o]` `[a]` `[i]` `[?]` and other types | reading a period back |
 | Already filed | `[>]` `[<]` `[+]` | recovery — see below |
 | Completed | `[x]` | a retrospective: what actually got done |
 | Cancelled | `[-]` | what you dropped |
 
-**Outstanding is more than tasks** — events `[o]`, appointments `[a]`,
-in-progress `[/]` and scheduled `[s]` are entries you act on in a review, so
-they are all listed.
+**Open work means what can still move** — a task, something scheduled, something
+in progress. An event or an appointment belongs to the day it happened:
+"migrate to next week" means nothing for a dinner that was on the 3rd, so those
+are left where they are unless you ask for them.
 
-**Plain bullets are not.** A bare `- note to self` is context, not something to
-triage: it travels with whatever task it sits under rather than appearing as its
-own line in the review. To move one deliberately, give it a marker —
-`- [->w] note` migrates it and keeps it a plain bullet at the destination.
+Marking one overrides that. `- [>fri] Dentist` is an explicit instruction to
+move it, so it appears in the review whatever type it is.
+
+**Plain bullets are not entries.** A bare `- note to self` is context: it travels
+with whatever task it sits under rather than appearing as its own line. To move
+one deliberately, give it a marker — `- [->w] note` migrates it and keeps it a
+plain bullet at the destination.
 
 Also left out:
 

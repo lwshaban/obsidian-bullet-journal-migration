@@ -46,6 +46,7 @@ function isDefaultInclusion(include: TaskInclusion): boolean {
 /** "already filed, completed" — the extras beyond a plain open-task review. */
 function describeExtras(include: TaskInclusion): string {
 	const labels: Partial<Record<keyof TaskInclusion, string>> = {
+		timebound: 'events',
 		migrated: 'already filed',
 		completed: 'completed',
 		cancelled: 'cancelled',
@@ -53,7 +54,7 @@ function describeExtras(include: TaskInclusion): string {
 	const extras = (Object.keys(labels) as (keyof TaskInclusion)[])
 		.filter(key => include[key])
 		.map(key => labels[key] as string);
-	if (!include.outstanding) extras.unshift('nothing outstanding');
+	if (!include.outstanding) extras.unshift('no open work');
 	return extras.join(', ');
 }
 
@@ -244,7 +245,7 @@ async function writeReview(bujo: BulletJournalMigration, kind: ReviewKind, revie
 export async function generateReview(bujo: BulletJournalMigration, request: ReviewRequest): Promise<void> {
 	const { scope, include } = request;
 	try {
-		if (!include.outstanding && !include.migrated && !include.completed && !include.cancelled) {
+		if (!Object.values(include).some(Boolean)) {
 			new Notice('Pick at least one kind of entry to include.');
 			return;
 		}

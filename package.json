@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-bujo",
-	"version": "0.7.5",
+	"version": "0.7.6",
 	"description": "Bullet Journal migration for Obsidian",
 	"main": "main.js",
 	"type": "module",

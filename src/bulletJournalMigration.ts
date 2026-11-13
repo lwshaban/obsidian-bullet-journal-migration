@@ -544,6 +544,14 @@ export class BulletJournalMigration {
      * `[>]`/`[<]`/`[+]` test is anchored to the closing bracket so a pending
      * instruction like `[>mon]` or `[>-]` still reads as outstanding.
      */
+    /**
+     * Checkbox states that represent open work rather than a record of
+     * something: empty, scheduled, in progress. Everything else with a
+     * checkbox — `[o]`, `[a]`, `[i]`, `[?]`, `[b]`, custom types — describes
+     * a moment rather than a job, so it is classified as time-bound.
+     */
+    private static readonly PORTABLE = new Set([' ', '', 's', '/']);
+
     classifyTaskState(line: string): keyof TaskInclusion | null {
         const trimmed = line.trim();
         if (!this.isBulletItem(trimmed)) return null;
@@ -566,7 +574,13 @@ export class BulletJournalMigration {
         if (this.isDeletedTask(trimmed)) return 'cancelled';
         if (/^-\s*\[(>|<|\+)\]/i.test(trimmed)) return 'migrated';
 
-        return 'outstanding';
+        // An explicit marker is an instruction to move this entry, whatever
+        // type it is — an event marked [>fri] is being deliberately moved, so
+        // it has to appear in the review that will process it.
+        if (this.hasMigrationMarker(trimmed)) return 'outstanding';
+
+        const state = (checkbox[1] ?? '').trim().toLowerCase();
+        return BulletJournalMigration.PORTABLE.has(state) ? 'outstanding' : 'timebound';
     }
 
     /**

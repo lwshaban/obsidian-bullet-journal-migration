@@ -143,8 +143,12 @@ const RANGE_LABELS: Record<RangeChoice, string> = {
 
 const INCLUDE_FIELDS: { key: keyof TaskInclusion; name: string; short: string; desc: string }[] = [
 	{
-		key: 'outstanding', name: 'Outstanding', short: 'outstanding entries',
-		desc: 'Everything still open: tasks, scheduled [s], events [o], appointments [a], notes, and anything already marked',
+		key: 'outstanding', name: 'Open work', short: 'open work',
+		desc: '[ ] tasks, [s] scheduled, [/] in progress, and anything already carrying a marker',
+	},
+	{
+		key: 'timebound', name: 'Events and the like', short: 'events',
+		desc: '[o] events, [a] appointments, [i] ideas and other types — they belong to the day they happened, so they are not migrated by default',
 	},
 	{
 		key: 'migrated', name: 'Already filed', short: 'already filed',
