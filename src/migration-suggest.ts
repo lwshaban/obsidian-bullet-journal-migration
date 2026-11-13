@@ -16,6 +16,7 @@ import {
 	moment,
 } from 'obsidian';
 import { describeMarker, matchesQuery } from './markers';
+import { getTaskText } from './utils';
 import type { BujoPluginSettings } from './settings';
 
 interface DestSuggestion {
@@ -27,6 +28,7 @@ interface DestSuggestion {
 }
 
 const PICK_DATE = '__pick__';
+const REPEAT = '__repeat__';
 
 /** How many entries get an Alt+N shortcut. */
 const QUICK_SELECT_MAX = 9;
@@ -52,6 +54,7 @@ function buildSuggestions(): DestSuggestion[] {
 		{ group: 'Month', label: 'This month', sub: today.format('MMMM YYYY'), code: ':m' },
 		{ group: 'Month', label: 'Next month', sub: nextMonth?.label ?? '', code: 'm' },
 		{ group: 'Custom', label: 'Pick a date…', sub: 'calendar · day / week / month', code: PICK_DATE },
+		{ group: 'Custom', label: 'Repeating…', sub: 'every N days / weeks / months', code: REPEAT },
 	];
 }
 
@@ -85,6 +88,14 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 	 * the user finished the job, never on a cancelled pick.
 	 */
 	onApplied: ((editor: Editor) => void) | null = null;
+
+	/**
+	 * Called for the "Repeating…" row, with the task text of the line the
+	 * picker was opened on. Recurrence has no marker to write — it lays down
+	 * occurrences in other notes — so it is handed back to the plugin, which
+	 * owns the modal and the engine call.
+	 */
+	onRepeat: ((editor: Editor, taskText: string) => void) | null = null;
 
 	/** The list currently on screen, so a number key can index straight into it. */
 	private shown: DestSuggestion[] = [];
@@ -166,7 +177,7 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		const explicit = explicitSuggestion(query);
 		if (explicit) return this.remember([explicit]);
 
-		const all = buildSuggestions();
+		const all = buildSuggestions().filter(s => s.code !== REPEAT || this.prefix === '>');
 		if (!query) return this.remember(all);
 
 		const filtered = all.filter(s => matchesQuery(s.code, s.label, query));
@@ -197,12 +208,13 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 	 * most-reached entry on the longest stretch (Alt+5).
 	 */
 	private numbered(): DestSuggestion[] {
-		return this.shown.filter(s => s.code !== PICK_DATE);
+		return this.shown.filter(s => s.code !== PICK_DATE && s.code !== REPEAT);
 	}
 
 	/** The entry an Alt+<code> keystroke selects, if any. */
 	private accelerated(code: string): DestSuggestion | undefined {
 		if (code === 'KeyD') return this.shown.find(s => s.code === PICK_DATE);
+		if (code === 'KeyR') return this.shown.find(s => s.code === REPEAT);
 
 		const digit = /^Digit([1-9])$/.exec(code);
 		if (!digit || digit[1] === undefined) return undefined;
@@ -223,6 +235,7 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 	/** The accelerator shown on the left of a row: "1".."9", or "D" for the calendar. */
 	private badgeFor(item: DestSuggestion): string | null {
 		if (item.code === PICK_DATE) return 'D';
+		if (item.code === REPEAT) return 'R';
 		const index = this.numbered().indexOf(item);
 		return index >= 0 && index < QUICK_SELECT_MAX ? String(index + 1) : null;
 	}
@@ -254,7 +267,7 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 		content.createDiv({ cls: 'suggestion-note', text: item.sub });
 		el.createDiv({
 			cls: 'suggestion-aux',
-			text: item.code === PICK_DATE ? '📅' : `[${this.prefix}${item.code}]`,
+			text: item.code === PICK_DATE ? '📅' : item.code === REPEAT ? '🔁' : `[${this.prefix}${item.code}]`,
 		});
 	}
 
@@ -277,6 +290,23 @@ export class MigrationSuggest extends EditorSuggest<DestSuggestion> {
 			editor.replaceRange(insert, start, end);
 			this.onApplied?.(editor);
 		};
+
+		if (item.code === REPEAT) {
+			// Recurrence leaves the source task alone, so the "[>]" the picker
+			// wrote has to come back off the line first: undo it where the
+			// keyboard flow armed one, and otherwise settle the half-typed
+			// marker into a plain checkbox.
+			const pending = this.takeRevert();
+			this.close();
+			if (pending) {
+				this.undo(pending);
+			} else {
+				editor.replaceRange(` ]${needsSpace ? ' ' : ''}`, start, end);
+			}
+			const settled = editor.getLine(start.line) ?? '';
+			this.onRepeat?.(editor, getTaskText(settled));
+			return;
+		}
 
 		if (item.code === PICK_DATE) {
 			// Hand the undo to the modal: closing the suggester must not revert

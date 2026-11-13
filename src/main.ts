@@ -1,10 +1,10 @@
-import { Plugin } from 'obsidian';
+import { Editor, Plugin } from 'obsidian';
 import { BulletJournalMigration } from './bulletJournalMigration';
 import { DEFAULT_SETTINGS, BujoPluginSettings } from './settings';
 import { BujoSettingTab } from './settings-tab';
 import { MigrationSuggest } from './migration-suggest';
 import { RecurringScheduleModal } from './recurring-ui';
-import { getTaskText } from './utils';
+import { ReviewQuickPick } from './review-ui';
 import { markForMigration, jumpToTask, setTaskState } from './shortcuts';
 import { setDebugLogging } from './log';
 
@@ -27,6 +27,14 @@ export default class BujoMigrationPlugin extends Plugin {
 		this.suggest.onApplied = (editor) => {
 			if (this.settings.autoAdvance) jumpToTask(editor, 1, this.jumpOptions());
 		};
+		// "Repeating…" in the picker: the one destination that isn't a marker.
+		this.suggest.onRepeat = (_editor, taskText) => {
+			new RecurringScheduleModal(
+				this.app,
+				taskText,
+				(text, everyN, unit, until) => this.bujo.scheduleRecurring(text, everyN, unit, until),
+			).open();
+		};
 		this.registerEditorSuggest(this.suggest);
 
 		// Register all commands
@@ -45,55 +53,58 @@ export default class BujoMigrationPlugin extends Plugin {
 		};
 	}
 
+	/**
+	 * The editor only when something is selected. "Migrate tasks" and
+	 * "Schedule tasks" act on a selection when there is one and on the whole
+	 * note otherwise, so each is one command rather than two — a selection is
+	 * a narrowing of the same intent, not a different one.
+	 */
+	selectionEditor(): Editor | null {
+		const editor = this.app.workspace.activeEditor?.editor;
+		return editor && editor.getSelection().trim() !== '' ? editor : null;
+	}
+
 	registerCommands() {
-		this.addCommand({
-			id: 'bujo-generate-monthly-review',
-			icon: 'calendar',
-			name: 'Generate monthly review',
-			callback: () => this.bujo.generateMonthlyReview()
-		});
+		// The three note-level actions share a "Run:" prefix so one query
+		// narrows the palette to them. Obsidian's style guide wants sentence
+		// case throughout, but the capital after the prefix is what makes the
+		// group read as a group rather than as a sentence fragment.
+		/* eslint-disable obsidianmd/ui/sentence-case -- deliberate "Run: Verb" grouping */
 
+		// Reviews have one entry point. It opens a short list — month, week,
+		// global, between dates — so the common ones cost a keystroke, with
+		// the full form (which entries to list) behind "More options…".
 		this.addCommand({
-			id: 'bujo-generate-weekly-review',
-			icon: 'calendar-days',
-			name: 'Generate weekly review',
-			callback: () => this.bujo.generateWeeklyReview()
-		});
-
-		this.addCommand({
-			id: 'bujo-migrate-selected-tasks',
-			icon: 'list-checks',
-			name: 'Migrate selected tasks',
-			editorCallback: (editor) => this.bujo.migrateSelectedTasks(editor)
+			id: 'bujo-generate-review',
+			icon: 'calendar-search',
+			name: 'Run: Generate review',
+			callback: () => new ReviewQuickPick(
+				this.app,
+				(request) => this.bujo.generateReview(request),
+			).open()
 		});
 
 		this.addCommand({
 			id: 'bujo-migrate-tasks',
 			icon: 'forward',
-			name: 'Migrate tasks',
-			callback: () => this.bujo.migrateTasks()
-		});
-
-		this.addCommand({
-			id: 'bujo-schedule-selected-tasks',
-			icon: 'alarm-clock',
-			name: 'Schedule selected tasks',
-			editorCallback: (editor) => this.bujo.scheduleSelectedTasks(editor)
+			name: 'Run: Migrate tasks',
+			callback: () => {
+				const editor = this.selectionEditor();
+				return editor ? this.bujo.migrateSelectedTasks(editor) : this.bujo.migrateTasks();
+			}
 		});
 
 		this.addCommand({
 			id: 'bujo-schedule-tasks',
 			icon: 'clock',
-			name: 'Schedule tasks',
-			callback: () => this.bujo.scheduleTasks()
+			name: 'Run: Schedule tasks',
+			callback: () => {
+				const editor = this.selectionEditor();
+				return editor ? this.bujo.scheduleSelectedTasks(editor) : this.bujo.scheduleTasks();
+			}
 		});
 
-		this.addCommand({
-			id: 'bujo-generate-global-review',
-			icon: 'list',
-			name: 'Generate global review',
-			callback: () => this.bujo.generateGlobalReview()
-		});
+		/* eslint-enable obsidianmd/ui/sentence-case */
 
 		this.addCommand({
 			id: 'bujo-mark-for-migration',
@@ -135,20 +146,6 @@ export default class BujoMigrationPlugin extends Plugin {
 			icon: 'x',
 			name: 'Cancel task',
 			editorCallback: (editor) => setTaskState(editor, '-', this.settings.autoAdvance)
-		});
-
-		this.addCommand({
-			id: 'bujo-schedule-recurring',
-			icon: 'repeat',
-			name: 'Schedule recurring task',
-			editorCallback: (editor) => {
-				const taskText = getTaskText(editor.getLine(editor.getCursor().line)) || '';
-				new RecurringScheduleModal(
-					this.app,
-					taskText,
-					(text, everyN, unit, until) => this.bujo.scheduleRecurring(text, everyN, unit, until),
-				).open();
-			}
 		});
 	}
 

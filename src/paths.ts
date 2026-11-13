@@ -10,7 +10,11 @@ import { BujoPluginSettings } from './settings';
 import { PeriodType } from './types';
 
 export type NoteKind = 'daily' | 'weekly' | 'monthly' | 'yearly' | 'future';
-export type ReviewKind = 'Weekly' | 'Monthly' | 'Global';
+/**
+ * `Range` is a review over arbitrary from→to dates, which has no natural home
+ * among the period folders.
+ */
+export type ReviewKind = 'Weekly' | 'Monthly' | 'Global' | 'Range';
 
 /** Trailing slashes make `startsWith` checks and joins inconsistent. */
 function normalizeFolder(folder: string): string {

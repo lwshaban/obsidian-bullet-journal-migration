@@ -413,3 +413,37 @@ body:not(.tasks) li[data-task="H"].task-list-item.is-checked {
 	margin-top: var(--size-2-1);
 	border-top: 1px solid var(--background-modifier-border);
 }
+
+/* Mobile: the popup shares the screen with the on-screen keyboard, so the
+   desktop allowance above is most of the viewport — it ran off the top and cut
+   the last group off the bottom. Cap it to a fraction of the screen and let it
+   scroll, drop the Alt+N badges (no Alt key on a phone, and tapping is the
+   point there), and tighten each row so more than two fit at once. */
+body.is-mobile .suggestion-container.bujo-suggest,
+body.is-mobile .suggestion-container.bujo-suggest .suggestion {
+	max-height: 40vh !important;
+}
+
+body.is-mobile .bujo-suggest-index {
+	display: none;
+}
+
+body.is-mobile .suggestion-container.bujo-suggest .suggestion-item {
+	padding-top: var(--size-2-2);
+	padding-bottom: var(--size-2-2);
+}
+
+body.is-mobile .suggestion-container.bujo-suggest .suggestion-title {
+	line-height: 1.3;
+}
+
+body.is-mobile .suggestion-container.bujo-suggest .suggestion-note {
+	font-size: var(--font-smallest);
+	line-height: 1.3;
+}
+
+body.is-mobile .bujo-suggest-group {
+	padding-top: var(--size-2-1);
+	padding-bottom: 0;
+	letter-spacing: 0.06em;
+}

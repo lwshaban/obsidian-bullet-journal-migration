@@ -2,7 +2,7 @@
 // Provides weekly and monthly review generation and processing
 
 import { App, TFile, moment, Editor } from 'obsidian';
-import { MigrationMarker, MigrationResult, TaskType, PeriodType, ChildTask, DestinationDate } from './types';
+import { MigrationMarker, MigrationResult, TaskType, PeriodType, ChildTask, DestinationDate, TaskInclusion } from './types';
 import {
 	normalizeText,
 	isIncompleteTask,
@@ -10,6 +10,7 @@ import {
 	isDeletedTask,
 	isScheduledTask,
 	isBulletItem,
+	isConsumedTask,
 	getTaskText,
 	getBulletMarker,
 	getIndentLevel,
@@ -25,6 +26,19 @@ import { BujoPluginSettings } from './settings';
 import { log } from './log';
 import * as reviews from './reviews';
 import * as taskCommands from './task-commands';
+
+/**
+ * What a destination write actually did.
+ *
+ * `duplicate` means nothing was written because an equivalent *live* item is
+ * already in the destination — the migration is satisfied, but no new line
+ * exists. Anything that cannot be confirmed throws instead of returning, so a
+ * caller can never mistake a silent no-op for a successful write.
+ */
+export interface AppendResult {
+	status: 'appended' | 'nested' | 'duplicate';
+	path: string;
+}
 
 /** The slice of Templater's plugin instance this code calls into. */
 interface TemplaterPlugin {
@@ -466,38 +480,50 @@ export class BulletJournalMigration {
     // =================================================================
 
     /**
-     * Get all incomplete tasks from a file (includes scheduled tasks [s] or [<])
-     * Also includes items with migration markers (for non-task items like events, information, etc.)
+     * Which inclusion group a line belongs to, or null when it isn't an entry
+     * a review can list (headings, prose, separators, empty bullets).
+     *
+     * Everything that isn't finished or filed is outstanding — events `[o]`,
+     * appointments `[a]`, in-progress `[/]`, scheduled `[s]` and plain
+     * information bullets included. Listing only `[ ]` meant a review silently
+     * dropped most of what a bullet journal page actually holds.
+     *
+     * Order matters: finished states are checked first, and the bare
+     * `[>]`/`[<]`/`[+]` test is anchored to the closing bracket so a pending
+     * instruction like `[>mon]` or `[>-]` still reads as outstanding.
      */
-    async getIncompleteTasks(filePath: string): Promise<string[]> {
-        log.debug(`*** getIncompleteTasks called for: ${filePath}`);
+    classifyTaskState(line: string): keyof TaskInclusion | null {
+        const trimmed = line.trim();
+        if (!this.isBulletItem(trimmed)) return null;
+
+        // An entry needs something to say: this filters out "---" rules and
+        // empty checkboxes. getTaskText alone won't do it — for "- [ ]" it
+        // falls through to its plain-bullet branch and reads the empty
+        // checkbox itself as the text.
+        const checkbox = trimmed.match(/^-\s*\[[^\]]+\]\s*(.*)$/);
+        const text = checkbox ? (checkbox[1] ?? '').trim() : this.getTaskText(trimmed);
+        if (!text) return null;
+
+        if (this.isCompletedTask(trimmed)) return 'completed';
+        if (this.isDeletedTask(trimmed)) return 'cancelled';
+        if (/^-\s*\[(>|<|\+)\]/i.test(trimmed)) return 'migrated';
+
+        return 'outstanding';
+    }
+
+    /**
+     * Lines from a note that a review should list, given the states asked for.
+     * Returns the original lines, indentation and all, in file order.
+     */
+    async collectTasks(filePath: string, include: TaskInclusion): Promise<string[]> {
         const file = this.app.vault.getAbstractFileByPath(filePath);
         if (!file || !(file instanceof TFile)) return [];
 
         const content = await this.app.vault.read(file);
         const lines = content.split('\n');
-        log.debug(`*** Processing ${lines.length} lines from ${filePath}`);
         return lines.filter(line => {
-            const trimmed = line.trim();
-            
-            // Explicitly exclude already-processed tasks - these shouldn't be in reviews
-            // [-] = cancelled, [x] = completed, [>] = migrated, [<] = scheduled elsewhere, [+] = new task created
-            // Note: Check trimmed line since tasks may have leading whitespace
-            if (/^-\s*\[(-|x|>|<|\+)\]/i.test(trimmed)) {
-                log.debug(`Excluding already-processed task from review: "${trimmed.substring(0, 50)}"`);
-                return false;
-            }
-            
-            // Include incomplete tasks and [s] scheduled tasks (scheduled in plan, not yet migrated)
-            if (this.isIncompleteTask(trimmed) || this.isScheduledTask(trimmed)) {
-                return true;
-            }
-            
-            // Include any bullet item with a migration marker (for events, information, etc.)
-            if (this.isBulletItem(trimmed) && this.hasMigrationMarker(trimmed)) {
-                return true;
-            }
-            return false;
+            const group = this.classifyTaskState(line);
+            return group !== null && include[group];
         });
     }
 
@@ -534,10 +560,67 @@ export class BulletJournalMigration {
     }
 
     /**
+     * The line in a batch that the migration is really about. A batch may lead
+     * with plain-bullet context parents (e.g. a migrated subtask carrying its
+     * parent chain), so the item to dedup and verify on is the first line with
+     * a checkbox, not the context header. The checkbox is anchored to the dash
+     * so wikilink brackets in a header aren't mistaken for one.
+     */
+    private primaryLineOf(taskLines: string[]): { line: string; contextCount: number } {
+        const isTaskLine = (l: string) => /^\s*-\s*\[[^\]]+\]/.test(l);
+        const primaryIndex = taskLines.findIndex(isTaskLine);
+        const line = taskLines[primaryIndex >= 0 ? primaryIndex : 0] ?? '';
+        return { line, contextCount: primaryIndex > 0 ? primaryIndex : 0 };
+    }
+
+    /**
+     * Read the destination back and prove the item is actually there, in a
+     * state that can still be acted on, before any caller is allowed to mark a
+     * source task migrated.
+     *
+     * Without this, a write that silently did nothing — a dedup hit against a
+     * crossed-out line from a previous cycle, a process callback that bailed,
+     * a destination that resolved to the source note itself — reported success
+     * and the source task was then marked `[>]`. The task existed nowhere.
+     */
+    private async confirmWritten(
+        filePath: string,
+        primaryLine: string,
+        status: AppendResult['status'],
+    ): Promise<AppendResult> {
+        const file = this.app.vault.getAbstractFileByPath(filePath);
+        if (!file || !(file instanceof TFile)) {
+            throw new Error(`Destination file missing after write: ${filePath}`);
+        }
+
+        const wanted = this.normalizeText(this.getTaskText(primaryLine));
+        if (!wanted) throw new Error(`Nothing to confirm in ${filePath}: empty task text`);
+
+        // A line counts as landed if it can still be worked, or if it carries
+        // exactly the state we were asked to write — a destination checkbox
+        // like {s} or {<} is deliberate, not a stale carcass.
+        const intended = this.getBulletMarker(primaryLine);
+        const content = await this.app.vault.read(file);
+        const landed = content.split('\n').some(line =>
+            this.isBulletItem(line)
+            && (!isConsumedTask(line) || (intended !== null && this.getBulletMarker(line) === intended))
+            && this.normalizeText(this.getTaskText(line)) === wanted);
+
+        if (!landed) {
+            throw new Error(`Destination write not confirmed in ${filePath}: "${wanted.substring(0, 60)}"`);
+        }
+        return { status, path: filePath };
+    }
+
+    /**
      * Append task(s) to file (creates from template if doesn't exist)
      * Can accept a single task line or an array of lines (parent + children)
+     *
+     * Resolves only once the item has been read back from the destination;
+     * every other outcome throws. Callers must not touch the source until this
+     * resolves — see confirmWritten.
      */
-    async appendToFile(filePath: string, taskLineOrLines: string | string[], monthName: string | null = null): Promise<void> {
+    async appendToFile(filePath: string, taskLineOrLines: string | string[], monthName: string | null = null): Promise<AppendResult> {
         // Normalize to array - if single line, wrap in array
         const requested = Array.isArray(taskLineOrLines) ? taskLineOrLines : [taskLineOrLines];
         // Every write funnels through here, so this is the one place that can
@@ -550,6 +633,7 @@ export class BulletJournalMigration {
         if (!taskLine) {
             throw new Error('No task line provided to append');
         }
+        const { line: primaryLine, contextCount } = this.primaryLineOf(taskLines);
         const kind = this.paths.classify(filePath);
         let file = this.app.vault.getAbstractFileByPath(filePath);
 
@@ -572,13 +656,13 @@ export class BulletJournalMigration {
                 if (!file || !(file instanceof TFile)) {
                     log.warn(`Template creation failed, creating empty file: ${filePath}`);
                     await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
-                    return;
+                    return this.confirmWritten(filePath, primaryLine, 'appended');
                 }
             } else {
                 log.debug(`No template found, creating file: ${filePath}`);
                 try {
                     await this.app.vault.create(filePath, taskLines.join('\n') + '\n');
-                    return;
+                    return this.confirmWritten(filePath, primaryLine, 'appended');
                 } catch (error) {
                     // Race: something else created the file between the existence
                     // check and create — fall through and append to it instead
@@ -590,6 +674,7 @@ export class BulletJournalMigration {
 
         // File exists (either already existed or was just created from template)
         // Append atomically so concurrent edits (sync, other plugins) aren't clobbered
+        let status: AppendResult['status'] = 'appended';
         await this.app.vault.process(file, (content) => {
         const lines = content.split('\n');
         let insertIndex = lines.length;
@@ -643,24 +728,19 @@ export class BulletJournalMigration {
             }
         }
 
-        // A batch may lead with plain-bullet context parents (e.g. a migrated
-        // subtask carrying its parent). The "real" task to dedup on is the first
-        // line with a checkbox, not the context header. Anchor the checkbox to
-        // the dash so wikilink brackets in a header aren't mistaken for one.
-        const isTaskLine = (l: string) => /^\s*-\s*\[[^\]]+\]/.test(l);
-        const primaryIndex = taskLines.findIndex(isTaskLine);
-        const contextCount = primaryIndex > 0 ? primaryIndex : 0;
-        const primaryLine = taskLines[primaryIndex >= 0 ? primaryIndex : 0] ?? taskLine;
-
-        // Deduplication: skip if the actual task already exists anywhere here
+        // Deduplication: skip only if a *live* copy of the task is already
+        // here. A crossed-out one ([x], [-], [>], [<]) is a record of a past
+        // cycle, not somewhere a task can land — treating it as a duplicate is
+        // what silently dropped migrations while marking their sources [>].
         const normalizedNewText = this.normalizeText(this.getTaskText(primaryLine));
         const existingTaskIndex = lines.findIndex(line => {
-            if (!this.isBulletItem(line)) return false;
+            if (!this.isBulletItem(line) || isConsumedTask(line)) return false;
             return this.normalizeText(this.getTaskText(line)) === normalizedNewText;
         });
 
         if (existingTaskIndex !== -1) {
-            log.debug(`Task already exists in ${filePath}, skipping duplicate: "${this.getTaskText(primaryLine)}"`);
+            log.debug(`Live copy already in ${filePath}, skipping duplicate: "${this.getTaskText(primaryLine)}"`);
+            status = 'duplicate';
             return content; // Skip adding duplicate task
         }
 
@@ -670,8 +750,10 @@ export class BulletJournalMigration {
         if (contextCount > 0) {
             const immediateParent = taskLines[contextCount - 1];
             const parentText = immediateParent ? this.normalizeText(this.getTaskText(immediateParent)) : '';
+            // A crossed-out parent is not somewhere to nest live work either.
             const existingParentIndex = parentText
-                ? lines.findIndex(l => this.isBulletItem(l) && this.normalizeText(this.getTaskText(l)) === parentText)
+                ? lines.findIndex(l => this.isBulletItem(l) && !isConsumedTask(l)
+                    && this.normalizeText(this.getTaskText(l)) === parentText)
                 : -1;
 
             if (existingParentIndex !== -1) {
@@ -696,6 +778,7 @@ export class BulletJournalMigration {
 
                 lines.splice(subtreeEnd, 0, ...rebased);
                 log.debug(`Nested ${rebased.length} line(s) under existing parent "${this.getTaskText(parentLine)}" in ${filePath}`);
+                status = 'nested';
                 return lines.join('\n');
             }
         }
@@ -705,6 +788,8 @@ export class BulletJournalMigration {
         log.debug(`Appended ${taskLines.length} line(s) to ${filePath}: ${taskLine}`);
         return lines.join('\n');
         });
+
+        return this.confirmWritten(filePath, primaryLine, status);
     }
 
     /**
@@ -724,11 +809,13 @@ export class BulletJournalMigration {
         if (!clean) return { created: 0, capped: false, targetType: '' };
 
         const { dates, targetType, capped } = computeRecurrence(everyN, unit, untilISO);
+        let created = 0;
         for (const date of dates) {
             const path = this.getTargetFilePath(date, targetType);
-            await this.appendToFile(path, `- [ ] ${clean}`);
+            const result = await this.appendToFile(path, `- [ ] ${clean}`);
+            if (result.status !== 'duplicate') created++;
         }
-        return { created: dates.length, capped, targetType };
+        return { created, capped, targetType };
     }
 
     /**
@@ -790,6 +877,7 @@ export class BulletJournalMigration {
         replacement: string,
         verb: string,
         filterFn: (line: string) => boolean,
+        leaveAlone?: (line: string) => boolean,
     ): Promise<MigrationResult> {
         try {
             const cleanTaskLine = this.removeMetadata(taskLine);
@@ -801,6 +889,7 @@ export class BulletJournalMigration {
 
             const cache = this.app.metadataCache.getFileCache(sourceFile);
             let found = false;
+            let preserved = false;
 
             await this.app.vault.process(sourceFile, (content) => {
                 const lines = content.split('\n');
@@ -808,14 +897,26 @@ export class BulletJournalMigration {
                 if (idx === -1) return content;
                 const line = lines[idx];
                 if (line === undefined) return content;
-                lines[idx] = line.replace(pattern, replacement);
                 found = true;
+                // A state we must not overwrite (already finished, or already
+                // further along than this verb would take it). Found, left as
+                // it is — not an error, or one stale line would keep a whole
+                // review from being filed away.
+                if (leaveAlone?.(line)) {
+                    preserved = true;
+                    return content;
+                }
+                lines[idx] = line.replace(pattern, replacement);
                 return lines.join('\n');
             });
 
             if (!found) {
                 log.error(`Task not found to ${verb}: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
                 return { success: false, error: 'Task not found' };
+            }
+            if (preserved) {
+                log.debug(`Left existing state alone instead of ${verb}: "${this.getTaskText(cleanTaskLine)}" in ${sourceFilePath}`);
+                return { success: true, skipped: true };
             }
             return { success: true };
         } catch (error) {
@@ -831,7 +932,10 @@ export class BulletJournalMigration {
         return this.replaceCheckbox(
             taskLine, sourceFilePath,
             /^(\s*-\s*)\[\s\]/, '$1[x]', 'complete',
-            (l) => this.isIncompleteTask(l),
+            // Already [x] counts as located: a task ticked in the source
+            // between generating a review and processing it is not an error.
+            (l) => this.isIncompleteTask(l) || this.isCompletedTask(l),
+            (l) => this.isCompletedTask(l),
         );
     }
 
@@ -842,7 +946,8 @@ export class BulletJournalMigration {
         return this.replaceCheckbox(
             taskLine, sourceFilePath,
             /^(\s*-\s*)\[\s\]/, '$1[-]', 'cancel',
-            (l) => this.isIncompleteTask(l),
+            (l) => this.isIncompleteTask(l) || this.isDeletedTask(l),
+            (l) => this.isDeletedTask(l),
         );
     }
 
@@ -908,8 +1013,12 @@ export class BulletJournalMigration {
         return this.replaceCheckbox(
             taskLine, sourceFilePath,
             /^(\s*-\s*)\[([^\]]+)\]/, '$1[s]', 'mark as scheduled',
-            // Any task, except ones already marked [>-] or [<]
-            (l) => /^\s*-\s*\[[^\]]+\]/.test(l) && !l.includes('[>-]') && !l.includes('[<]'),
+            (l) => /^\s*-\s*\[[^\]]+\]/.test(l),
+            // Never walk a task backwards into [s]: finished work stays
+            // finished, and [>-]/[<] are further along than "scheduled".
+            // Already [s] is nothing to do.
+            (l) => this.isCompletedTask(l) || this.isDeletedTask(l) || this.isScheduledTask(l)
+                || l.includes('[>-]') || l.includes('[<]'),
         );
     }
 
@@ -921,6 +1030,8 @@ export class BulletJournalMigration {
             taskLine, sourceFilePath,
             /^(\s*-\s*)\[([^\]]+)\]/, '$1[>]', 'mark as migrated',
             (l) => /^\s*-\s*\[[^\]]+\]/.test(l),
+            // Finished work stays finished, and an already-[>] line is done.
+            (l) => this.isCompletedTask(l) || this.isDeletedTask(l) || /^\s*-\s*\[>\]/.test(l),
         );
     }
 
@@ -1211,27 +1322,60 @@ export class BulletJournalMigration {
                 // Determine the marker to use: [<] for scheduled, [>-] for migrated
                 const targetMarker = marker === 'scheduled' ? '[<]' : '[>-]';
                 let foundParent = false;
+                let alreadyMarked = false;
                 let childrenMarkedCount = 0;
 
                 log.debug(`Looking for task to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
 
-                // Mark parent and its incomplete children in one atomic pass
+                // Mark the parent and its outstanding children in one atomic
+                // pass.
+                //
+                // "Outstanding" is any state that isn't finished — [ ], [s],
+                // [o], [/] and so on. Matching and rewriting only [ ] meant a
+                // scheduled task marked [<] in a review was either reported as
+                // not found or, once found, left exactly as it was: the review
+                // said the task had been dealt with and the source never
+                // changed. A marker in a review is an instruction, so it
+                // overrides whatever open state the task is in.
+                //
+                // A line already in the target state counts as found: a
+                // recovery review (TaskInclusion's `migrated`) is
+                // full of [<] lines the user left alone, and re-asserting
+                // their state is not an error. So is finished work, which is
+                // preserved rather than walked backwards.
+                const anyCheckbox = /^(\s*-\s*)\[[^\]]+\]/;
+                const finished = (l: string) => this.isCompletedTask(l) || this.isDeletedTask(l);
                 await this.app.vault.process(sourceFile, (content) => {
                     const lines = content.split('\n');
-                    const parentIndex = locateTaskLine(lines, cleanTaskLine, cache, (l) => this.isIncompleteTask(l));
-                    if (parentIndex === -1) return content;
+                    const markable = (l: string) => anyCheckbox.test(l) && !finished(l);
+                    const parentIndex = locateTaskLine(lines, cleanTaskLine, cache, markable);
+                    if (parentIndex === -1) {
+                        // Nothing outstanding under that text. Either the task
+                        // has since been finished — leave it, and don't fail
+                        // the review over it — or it really isn't here.
+                        if (locateTaskLine(lines, cleanTaskLine, cache, (l) => anyCheckbox.test(l)) !== -1) {
+                            foundParent = true;
+                            alreadyMarked = true;
+                        }
+                        return content;
+                    }
                     const parentLine = lines[parentIndex];
                     if (parentLine === undefined) return content;
                     foundParent = true;
 
+                    if (parentLine.includes(targetMarker)) {
+                        alreadyMarked = true;
+                        return content;
+                    }
+
                     const parentIndent = this.getIndentLevel(parentLine);
-                    lines[parentIndex] = parentLine.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
+                    lines[parentIndex] = parentLine.replace(anyCheckbox, `$1${targetMarker}`);
 
                     for (const child of this.collectChildTasks(lines, parentIndex, parentIndent)) {
-                        if (this.isIncompleteTask(child.line)) {
-                            lines[child.index] = child.line.replace(/^(\s*-\s*)\[\s\]/, `$1${targetMarker}`);
-                            childrenMarkedCount++;
-                        }
+                        if (!anyCheckbox.test(child.line) || finished(child.line)) continue;
+                        if (child.line.includes(targetMarker)) continue;
+                        lines[child.index] = child.line.replace(anyCheckbox, `$1${targetMarker}`);
+                        childrenMarkedCount++;
                     }
                     return lines.join('\n');
                 });
@@ -1239,6 +1383,11 @@ export class BulletJournalMigration {
                 if (!foundParent) {
                     log.error(`Task not found to mark as ${marker}: "${taskText.trim()}" in ${sourceFilePath}`);
                     return { success: false, error: 'Task not found' };
+                }
+
+                if (alreadyMarked) {
+                    log.debug(`Task already ${targetMarker} in ${sourceFilePath}, nothing to do`);
+                    return { success: true, sourceFile: sourceFilePath, destFile: null, skipped: true };
                 }
 
                 log.debug(`Marked parent and ${childrenMarkedCount} child task(s) as ${marker}`);
@@ -1253,6 +1402,18 @@ export class BulletJournalMigration {
 
             const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
             log.debug(`Target file path: ${targetFilePath}`);
+
+            // A marker that resolves to the note the task already lives in has
+            // nowhere to move it: the append would dedup against the task
+            // itself and the source update would then cross it out. Fail so the
+            // task keeps its marker and the review is kept for another pass.
+            if (sourceFilePath && targetFilePath === sourceFilePath) {
+                log.error(`Marker [>${marker}] resolves to the task's own note: ${targetFilePath}`);
+                return {
+                    success: false,
+                    error: `[>${marker}] resolves to this note itself (${targetFilePath}) — pick a different destination`,
+                };
+            }
 
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
@@ -1428,13 +1589,21 @@ export class BulletJournalMigration {
             }
             log.debug(`Updated source line: ${updatedSourceLine}`);
 
+            // Commit order matters: the destination write is confirmed first,
+            // and the source is only marked once it has. The worst case is a
+            // duplicate at the destination (which the next run dedups away);
+            // the alternative is a task marked migrated into thin air.
+            let appended: AppendResult;
             try {
-                await this.appendToFile(targetFilePath, allDestLines, destination.monthName);
+                appended = await this.appendToFile(targetFilePath, allDestLines, destination.monthName);
                 const migratedChildrenCount = destChildLines.length;
                 if (migratedChildrenCount > 0) {
-                    log.debug(`Successfully appended ${allDestLines.length} line(s) (parent + ${migratedChildrenCount} migrated children) to ${targetFilePath}`);
+                    log.debug(`Confirmed ${allDestLines.length} line(s) (parent + ${migratedChildrenCount} migrated children) in ${targetFilePath} [${appended.status}]`);
                 } else {
-                    log.debug(`Successfully appended parent task to ${targetFilePath} (${childTasks.length} children without markers stayed in source)`);
+                    log.debug(`Confirmed parent task in ${targetFilePath} [${appended.status}] (${childTasks.length} children without markers stayed in source)`);
+                }
+                if (appended.status === 'duplicate') {
+                    log.warn(`"${cleanTaskText.substring(0, 60)}" was already open in ${targetFilePath}; source marked migrated without a second copy`);
                 }
             } catch (error) {
                 log.error(`Failed to append task to ${targetFilePath}:`, error);
@@ -1481,7 +1650,12 @@ export class BulletJournalMigration {
                 log.debug(`Skipping source update for new task marker [+>`);
             }
 
-            return { success: true, sourceFile: sourceFilePath, destFile: targetFilePath };
+            return {
+                success: true,
+                sourceFile: sourceFilePath,
+                destFile: targetFilePath,
+                deduped: appended.status === 'duplicate',
+            };
         } catch (error) {
             log.error(`Migration error:`, error);
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1593,6 +1767,16 @@ export class BulletJournalMigration {
             const targetFilePath = this.getTargetFilePath(destination.date, destination.targetType);
             log.debug(`Target file path: ${targetFilePath}`);
 
+            // Same guard as migrateTask: scheduling a task into the note it is
+            // already in would mark it [s] with no scheduled copy anywhere.
+            if (sourceFilePath && targetFilePath === sourceFilePath) {
+                log.error(`Marker [>${marker}] resolves to the task's own note: ${targetFilePath}`);
+                return {
+                    success: false,
+                    error: `[>${marker}] resolves to this note itself (${targetFilePath}) — pick a different destination`,
+                };
+            }
+
             const taskText = this.getTaskText(taskLine);
             const cleanTaskText = this.removeMetadata(taskText);
             log.debug(`Task text: "${taskText}", cleaned: "${cleanTaskText}"`);
@@ -1676,12 +1860,14 @@ export class BulletJournalMigration {
             const updatedSourceLine = taskLine.replace(/^(\s*-\s*)\[[^\]]+\]/, '$1[s]');
             log.debug(`Updated source line (scheduled): ${updatedSourceLine}`);
 
+            // Destination first, confirmed, before the source is marked [s].
+            let appended: AppendResult;
             try {
-                await this.appendToFile(targetFilePath, allDestLines, destination.monthName || null);
+                appended = await this.appendToFile(targetFilePath, allDestLines, destination.monthName || null);
                 if (destChildLines.length > 0) {
-                    log.debug(`Successfully appended task with ${destChildLines.length} children to ${targetFilePath}`);
+                    log.debug(`Confirmed task with ${destChildLines.length} children in ${targetFilePath} [${appended.status}]`);
                 } else {
-                    log.debug(`Successfully appended task to ${targetFilePath}`);
+                    log.debug(`Confirmed task in ${targetFilePath} [${appended.status}]`);
                 }
             } catch (error) {
                 log.error(`Failed to append task to ${targetFilePath}:`, error);
@@ -1723,7 +1909,13 @@ export class BulletJournalMigration {
                 log.debug(`Skipping source update for new task marker [+>`);
             }
 
-            return { success: true, sourceFile: sourceFilePath, destFile: targetFilePath, childrenMarked: childUpdates.length };
+            return {
+                success: true,
+                sourceFile: sourceFilePath,
+                destFile: targetFilePath,
+                childrenMarked: childUpdates.length,
+                deduped: appended.status === 'duplicate',
+            };
         } catch (error) {
             log.error(`Planning migration error:`, error);
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1740,24 +1932,21 @@ export class BulletJournalMigration {
     // recursion inside the engine all keep working unchanged.
     // =================================================================
 
-    async generateWeeklyReview(weekString: string | null = null): Promise<void> {
-        return reviews.generateWeeklyReview(this, weekString);
-    }
-
     async migrateWeeklyReview(): Promise<void> {
         return reviews.migrateWeeklyReview(this);
-    }
-
-    async generateMonthlyReview(monthString: string | null = null): Promise<void> {
-        return reviews.generateMonthlyReview(this, monthString);
     }
 
     async migrateMonthlyReview(): Promise<void> {
         return reviews.migrateMonthlyReview(this);
     }
 
-    async generateGlobalReview(): Promise<void> {
-        return reviews.generateGlobalReview(this);
+    /** Any scope, any set of task states — what the "Generate review" modal calls. */
+    async generateReview(request: reviews.ReviewRequest): Promise<void> {
+        return reviews.generateReview(this, request);
+    }
+
+    async migrateRangeReview(): Promise<void> {
+        return reviews.migrateRangeReview(this);
     }
 
     async migrateGlobalReview(): Promise<void> {

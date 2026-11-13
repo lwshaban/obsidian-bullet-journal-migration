@@ -31,6 +31,30 @@ export function isBulletItem(line: string): boolean {
 	return /^\s*-\s*(\[[^\]]+\]|.+)/.test(trimmed) || /^\s*-\s+/.test(trimmed);
 }
 
+/**
+ * Checkbox states that mean the item is no longer actionable where it sits:
+ * done, cancelled, migrated away, scheduled elsewhere, or already spawned.
+ *
+ * `[s]` is deliberately NOT one of them. Scheduled is outstanding work — the
+ * task has a date, not a resolution — so an `[s]` line is somewhere a task can
+ * land, it shows up in reviews, and a marker in a review overrides it like any
+ * other open state.
+ */
+const CONSUMED_MARKERS = new Set(['x', '-', '>', '<', '+', '>-']);
+
+/**
+ * True when a line is a task that has already been dealt with in this note.
+ *
+ * This is what separates "the task is at the destination" from "a crossed-out
+ * record of it is". A consumed line must never satisfy a migration: dedup
+ * against one marks the source migrated with nothing live to migrate to, and
+ * the task is gone.
+ */
+export function isConsumedTask(line: string): boolean {
+	const marker = getBulletMarker(line);
+	return marker !== null && CONSUMED_MARKERS.has(marker.toLowerCase());
+}
+
 // ── Line helpers ───────────────────────────────────────────────────────────────
 
 export function getTaskText(line: string): string {

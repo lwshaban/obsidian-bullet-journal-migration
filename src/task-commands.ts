@@ -431,6 +431,8 @@ export async function migrateTasks(bujo: BulletJournalMigration): Promise<void> 
             return await bujo.migrateMonthlyReview();
         } else if (paths.isReview(path, 'Global')) {
             return await bujo.migrateGlobalReview();
+        } else if (paths.isReview(path, 'Range')) {
+            return await bujo.migrateRangeReview();
         }
         // Journal notes
         const kind = paths.classify(path);

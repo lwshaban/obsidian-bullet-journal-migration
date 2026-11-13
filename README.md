@@ -31,6 +31,7 @@ Journal/
 └── Bujo Reviews/           # Generated reviews
     ├── Weekly/             #   YYYY-Www-Review.md
     ├── Monthly/            #   YYYY-MM-Review.md
+    ├── Range/              #   YYYY-MM-DD_YYYY-MM-DD-Review.md
     └── Global/             #   Global-Review-YYYY-MM-DD-HHmm.md
 ```
 
@@ -82,7 +83,7 @@ You don't have to memorize the marker codes below. In any task line, start typin
 - **Pick a date…** — opens a calendar where clicking a **day** targets the daily note, a **week number** the weekly note, and the **month title** the monthly note
 - Type a code directly (e.g. `[>w2`, `[>fri`, `[>m3w`) and the popup previews the exact resulting date
 
-Markers resolve **relative to the note they're in**: `[>w]` in a `2026-W31` weekly note means W32, not "next week from today". This keeps migrations correct when you process past notes during a review.
+Relative markers resolve **from today**, not from the note they're written in: `[>w]` means the week after this one, wherever you typed it. Reviews are processed days or weeks after the notes were written, and anchoring on the note meant `[>>]` in last Tuesday's note migrated a task into last Wednesday — the past, where you'd never see it again. Explicit destinations (`[>2026-12-15]`, `[>2026-W32]`, `[>2026-12]`) always mean exactly what they say.
 
 The `[+>` (new task) and `[->` (information point) prefixes get the same autocomplete.
 
@@ -108,7 +109,7 @@ Add these markers as the checkbox in your task notes:
 | Marker | Description |
 |--------|-------------|
 | `[>mon]`, `[>tue]`, `[>wed]`, `[>thu]`, `[>fri]`, `[>sat]`, `[>sun]` | Next occurrence of that day |
-| `[>w1]`, `[>w2]`, `[>w3]`, `[>w4]` | 1-4 weeks on from the note's own date |
+| `[>w1]`, `[>w2]`, `[>w3]`, `[>w4]` | 1-4 weeks on from today |
 | `[>m1w]` … `[>m4w]` | Nth week of the month, rolling into next month if that week has already started |
 
 ### Specific Month Markers
@@ -181,34 +182,81 @@ Migrate items as plain list items (no checkboxes):
 
 ## Commands
 
+Nine commands, in two groups. The three you run on a note are prefixed `Run:`,
+so typing `bujo run` in the palette narrows to exactly those; the cursor-level
+ones keep plain names and are usually bound to keys rather than searched for.
+(Obsidian's **Command palette** core plugin can also pin commands to the top of
+the list, which works without any naming convention.)
+
+### Generate review
+**Command:** `Run: Generate review`
+
+Opens a short list — pick one and it generates:
+
+| Row | What it does |
+|---|---|
+| **Week** | last week, or the week of the note you're in |
+| **Month** | last month, or the month of the note you're in |
+| **Global** | every journal note whose period has passed |
+| **Between dates…** | any from→to range, up to 1000 days |
+| **More options…** | the full form: period *and* which entries to list |
+
+The form adds one more choice — **Include**:
+
+| Toggle | Entries | Use |
+|---|---|---|
+| Outstanding | `[ ]` `[s]` `[o]` `[a]` `[/]`, information bullets, anything already marked | the normal review; on by default |
+| Already filed | `[>]` `[<]` `[+]` | recovery — see below |
+| Completed | `[x]` | a retrospective: what actually got done |
+| Cancelled | `[-]` | what you dropped |
+
+**Outstanding is the whole page, not just tasks** — events, appointments and
+information points are journal entries too, and a review that hides them isn't a
+review.
+
+**Already filed** is the way back to a task whose migration didn't land where you
+expected: a normal review treats `[>]` as settled and will never show it again.
+Replace the `[>]` with a destination marker (e.g. `[>m]`) to migrate it again;
+leave it as `[>]` to ignore it.
+
+Completed and cancelled entries are listed for reference — leaving an `[x]` or
+`[-]` line alone changes nothing in the source.
+
+Anything beyond outstanding entries is written to a separate `…-Review-all`
+note, so a review you have already marked up is never overwritten. Date-range
+reviews land in `Bujo Reviews/Range/`.
+
+Once every entry in a review has been dealt with, the review file is moved to
+the vault trash. If anything failed, the review is **kept** so you can see what
+is outstanding and run it again — the notice tells you how many failed.
+
 ### Migrate tasks
-**Command:** `Migrate tasks`
+**Command:** `Run: Migrate tasks`
 
-Processes the current note, migrating all marked tasks to their destinations. Auto-detects the note type (daily, weekly, monthly, or a generated review) — this is the one command you run to "process" whatever note you're in.
+Processes the current note, migrating all marked tasks to their destinations.
+Auto-detects the note type (daily, weekly, monthly, or a generated review) — this
+is the one command you run to "process" whatever note you're in. **With text
+selected it processes only the selection**, which is how you work through a long
+review a few items at a time.
 
-### Migrate selected tasks
-**Command:** `Migrate selected tasks`
+### Schedule tasks
+**Command:** `Run: Schedule tasks`
 
-Same as **Migrate tasks**, but only processes the lines you have selected. Useful in review documents where you want to migrate a few items at a time.
+Like **Run: Migrate tasks** — including the selection rule — but marks the source
+`[s]` (scheduled) instead of `[>]` (migrated), for planning notes where the task
+is being placed onto a future date rather than moved out.
 
-### Schedule tasks / Schedule selected tasks
-**Commands:** `Schedule tasks`, `Schedule selected tasks`
+### Task commands
 
-Like the migrate commands, but mark the source with `[s]` (scheduled) instead of `[>]` (migrated) — for planning notes where the task is being placed onto a future date rather than moved out.
+| Command | Does |
+|---|---|
+| `Mark task for migration` | opens the checkbox and the destination picker on the current line |
+| `Complete task` / `Cancel task` | set `[x]` / `[-]`, advancing to the next task if **Auto-advance** is on |
+| `Go to next task` / `Go to previous task` | walk the note's tasks |
+| `Go to next unfinished task` | skip anything already dealt with |
 
-### Schedule recurring task
-**Command:** `Schedule recurring task`
-
-Lays down every occurrence of the current task from now until a date you choose, stepping by a customisable interval. See [Recurring Tasks](#recurring-tasks).
-
-### Generate weekly / monthly / global review
-**Commands:** `Generate weekly review`, `Generate monthly review`, `Generate global review`
-
-Create a review document collecting all incomplete tasks for the period (the week's/month's daily notes and higher-level notes; the global review spans all periods). Add markers to the review, then run **Migrate tasks** on it to send everything to its destination.
-
-Once every task in a review has been dealt with, the review file is moved to the
-vault trash. If anything failed to migrate, the review is **kept** so you can see
-what is outstanding and run it again — the notice tells you how many failed.
+Recurring tasks have no command of their own: **Repeating…** is a row in the
+destination picker (`Alt+R`). See [Recurring Tasks](#recurring-tasks).
 
 ## Settings
 
@@ -219,7 +267,10 @@ what is outstanding and run it again — the notice tells you how many failed.
 
 ## Recurring Tasks
 
-Run **Schedule recurring task** on a task line to open a small dialog:
+Open the destination picker on a task line — type `[>` or run
+**Mark task for migration** — and choose **Repeating…** (or press `Alt+R`).
+Unlike every other row it writes no marker, because recurrence isn't one
+destination; it opens a small dialog:
 
 - **Every** N **days / weeks / months** — the unit picks where occurrences land, matching the markers: days → daily notes, weeks → weekly notes, months → monthly notes.
 - **Until** a date (defaults to the end of the year).
@@ -271,10 +322,36 @@ Every occurrence is created as a plain `- [ ]` task in the matching note, up to 
   - Children can override parent's destination with their own marker
 - **Migrating a subtask alone**: its parent is carried along as a plain-bullet **context** line (not a duplicate task) so the subtask doesn't arrive orphaned; if that parent already exists at the destination, the subtask nests under it
 - **Information points**: Created as plain list items without checkboxes
-- **Deduplication**: Tasks with identical text (normalized) are not added if they already exist in the destination
+- **Deduplication**: Tasks with identical text (normalized) are not added if an **open** copy already exists in the destination
   - Prevents duplicate entries when migrating the same task multiple times
   - Comparison is case-insensitive and ignores extra whitespace
   - Example: Migrating "Call dentist" to Friday on Monday, Tuesday, and Wednesday results in only one entry in Friday's note
+  - A copy there that has already been dealt with (`[x]`, `[-]`, `[>]`, `[<]`, `[+]`) is a record of a past cycle, not a place for the task to land, so a fresh open copy is written
+  - `[s]` is **not** dealt with. Scheduled means the task has a date, not a resolution: it still counts as a copy at the destination, it shows up in reviews, and a marker in a review overrides it
+
+### Nothing is marked migrated until it has landed
+
+A source task is only crossed out once the item has been **read back** from its
+destination note. The destination is written first and verified; the source is
+touched after. So:
+
+- If the destination write fails or silently does nothing, the task keeps its
+  marker, the migration is reported as an error, and the review is kept for
+  another pass. A task is never marked `[>]` with nowhere to go.
+- A marker that resolves to the note the task is already in (e.g. `[>:m]` inside
+  this month's note) is refused with an error rather than crossing the task out
+  in place.
+- The worst case is a duplicate at the destination, which the next run dedups
+  away — never a lost task.
+- When the destination already held an open copy, the migration counts but the
+  notice says so: `• n already open at destination (merged)`.
+- A marker in a review overrides whatever **open** state the task is in — `[ ]`,
+  `[s]`, `[o]`, `[/]` — not just an empty checkbox. Marking a scheduled task
+  `[<]` in a review rewrites the source, and carries its open children with it.
+- States are never walked backwards: completing a task that is already `[x]`,
+  or scheduling one that is already `[<]`, leaves it as it is and reports a skip
+  instead of failing the whole review. Finished work (`[x]`, `[-]`) is never
+  overridden.
 
 ### Child Task Migration Example
 
@@ -376,7 +453,7 @@ Every occurrence is created as a plain `- [ ]` task in the matching note, up to 
 
 The plugin detected that "Call dentist" already exists in Friday's note, so it skipped the duplicate migrations from Tuesday and Wednesday.
 
-**Note:** Deduplication uses normalized text comparison (case-insensitive, ignores extra whitespace and wiki link brackets). Tasks with different wording are treated as separate tasks.
+**Note:** Deduplication uses normalized text comparison (case-insensitive, ignores extra whitespace and wiki link brackets). Tasks with different wording are treated as separate tasks. Only **open** items count as duplicates — if Friday's note already has `- [>] Call dentist` from an earlier cycle, a new `- [ ] Call dentist` is still written.
 
 ## Installation
 
