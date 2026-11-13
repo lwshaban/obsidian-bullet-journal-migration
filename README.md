@@ -214,6 +214,11 @@ The form adds one more choice — **Include**:
 information points are journal entries too, and a review that hides them isn't a
 review.
 
+One exception: an entry longer than **1000 characters** is held back and the
+review says so. That length is pasted content rather than a journal entry, and
+a single very long line makes the whole review unusable to type in — the editor
+re-renders it on every keystroke. The entry stays untouched in its own note.
+
 **Already filed** is the way back to a task whose migration didn't land where you
 expected: a normal review treats `[>]` as settled and will never show it again.
 Replace the `[>]` with a destination marker (e.g. `[>m]`) to migrate it again;

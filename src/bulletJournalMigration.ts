@@ -40,6 +40,25 @@ export interface AppendResult {
 	path: string;
 }
 
+/**
+ * Longest line a review will list.
+ *
+ * A journal entry is a sentence or two. A line past this is pasted content — an
+ * embedded data URI, a transcript — and putting one in a review makes the whole
+ * note unusable: CodeMirror re-tokenizes a line on every keystroke, so a single
+ * 240KB bullet costs seconds per character typed.
+ *
+ * Held back rather than shortened: processing locates a task by matching its
+ * text, so a truncated copy could never be acted on, and silently rewriting
+ * someone's note content is worse than omitting it.
+ */
+export const MAX_REVIEW_LINE = 1000;
+
+/** What a collection pass held back, for the review to report. */
+export interface CollectStats {
+	oversized: number;
+}
+
 /** The slice of Templater's plugin instance this code calls into. */
 interface TemplaterPlugin {
 	templater: {
@@ -514,8 +533,11 @@ export class BulletJournalMigration {
     /**
      * Lines from a note that a review should list, given the states asked for.
      * Returns the original lines, indentation and all, in file order.
+     *
+     * Oversized entries are held back and counted in `stats` — see
+     * MAX_REVIEW_LINE.
      */
-    async collectTasks(filePath: string, include: TaskInclusion): Promise<string[]> {
+    async collectTasks(filePath: string, include: TaskInclusion, stats?: CollectStats): Promise<string[]> {
         const file = this.app.vault.getAbstractFileByPath(filePath);
         if (!file || !(file instanceof TFile)) return [];
 
@@ -523,7 +545,14 @@ export class BulletJournalMigration {
         const lines = content.split('\n');
         return lines.filter(line => {
             const group = this.classifyTaskState(line);
-            return group !== null && include[group];
+            if (group === null || !include[group]) return false;
+
+            if (line.length > MAX_REVIEW_LINE) {
+                log.warn(`Held a ${line.length}-character entry out of the review: ${filePath}`);
+                if (stats) stats.oversized++;
+                return false;
+            }
+            return true;
         });
     }
 

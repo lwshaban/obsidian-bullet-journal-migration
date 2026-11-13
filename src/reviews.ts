@@ -14,6 +14,7 @@
 import { Notice, moment } from 'obsidian';
 import type { BulletJournalMigration } from './bulletJournalMigration';
 import { TaskInclusion, OUTSTANDING_ONLY } from './types';
+import { CollectStats, MAX_REVIEW_LINE } from './bulletJournalMigration';
 import { ReviewKind, BujoPaths } from './paths';
 import { log } from './log';
 
@@ -109,14 +110,32 @@ async function collectBySource(
 	bujo: BulletJournalMigration,
 	notePaths: string[],
 	include: TaskInclusion,
+	stats: CollectStats,
 ): Promise<Record<string, string[]>> {
 	const bySource: Record<string, string[]> = {};
 	for (const path of notePaths) {
-		const tasks = await bujo.collectTasks(path, include);
+		const tasks = await bujo.collectTasks(path, include, stats);
 		if (tasks.length === 0) continue;
 		(bySource[path] ??= []).push(...tasks);
 	}
 	return bySource;
+}
+
+/**
+ * A line about what was held back, or nothing. Said out loud in the review
+ * rather than only in the console: an entry that silently never appears is
+ * the same failure as a task that silently never migrates.
+ */
+function oversizedNote(stats: CollectStats): string[] {
+	if (stats.oversized === 0) return [];
+	const n = stats.oversized;
+	return [
+		'',
+		`> [!warning] ${n} ${n === 1 ? 'entry was' : 'entries were'} too long to list`,
+		`> ${n === 1 ? 'It is' : 'They are'} over ${MAX_REVIEW_LINE} characters — pasted content rather than a journal entry.`,
+		`> ${n === 1 ? 'It has' : 'They have'} been left untouched in ${n === 1 ? 'its' : 'their'} own note. A line that long makes a review`,
+		'> unusable to type in, so it is held back rather than copied here.',
+	];
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -164,7 +183,13 @@ function instructionLines(include: TaskInclusion): string[] {
 }
 
 /** A flat review: one section per source note, states mixed in file order. */
-function renderGrouped(title: string, bySource: Record<string, string[]>, include: TaskInclusion, emptyNote: string): string {
+function renderGrouped(
+	title: string,
+	bySource: Record<string, string[]>,
+	include: TaskInclusion,
+	emptyNote: string,
+	stats: CollectStats,
+): string {
 	const lines = [title, ''];
 
 	if (Object.keys(bySource).length === 0) {
@@ -177,6 +202,7 @@ function renderGrouped(title: string, bySource: Record<string, string[]>, includ
 		});
 	}
 
+	lines.push(...oversizedNote(stats));
 	lines.push(...instructionLines(include));
 	return lines.join('\n');
 }
@@ -281,11 +307,13 @@ export async function generateReview(bujo: BulletJournalMigration, request: Revi
 		}
 
 		new Notice('Generating review...');
-		const bySource = await collectBySource(bujo, notePaths, include);
-		await writeReview(bujo, kind, reviewPath, renderGrouped(title, bySource, include, emptyNote));
+		const stats: CollectStats = { oversized: 0 };
+		const bySource = await collectBySource(bujo, notePaths, include, stats);
+		await writeReview(bujo, kind, reviewPath, renderGrouped(title, bySource, include, emptyNote, stats));
 
 		const total = Object.values(bySource).reduce((sum, tasks) => sum + tasks.length, 0);
-		new Notice(`Review created: ${reviewPath} (${total} item${total === 1 ? '' : 's'})`);
+		new Notice(`Review created: ${reviewPath} (${total} item${total === 1 ? '' : 's'})`
+			+ (stats.oversized > 0 ? `\n• ${stats.oversized} too long to list` : ''));
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
 		new Notice(`Error: ${errorMessage}`);
@@ -342,10 +370,11 @@ export async function generateGlobalReview(bujo: BulletJournalMigration, include
 		const sections: Record<string, { path: string; tasks: string[] }[]> = {
 			'Daily Notes': [], 'Weekly Notes': [], 'Monthly Notes': [],
 		};
+		const stats: CollectStats = { oversized: 0 };
 		let total = 0;
 
 		for (const file of journalFiles) {
-			const tasks = await bujo.collectTasks(file.path, include);
+			const tasks = await bujo.collectTasks(file.path, include, stats);
 			if (tasks.length === 0) continue;
 			const kind = paths.classify(file.path);
 			const section = (kind && sectionNames[kind]) || '';
@@ -371,6 +400,7 @@ export async function generateGlobalReview(bujo: BulletJournalMigration, include
 			lines.push('---', `**Total: ${total} item${total === 1 ? '' : 's'}**`, '');
 		}
 
+		lines.push(...oversizedNote(stats));
 		lines.push(...instructionLines(include));
 
 		await writeReview(bujo, 'Global', reviewPath, lines.join('\n'));

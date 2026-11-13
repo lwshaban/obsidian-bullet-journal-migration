@@ -386,17 +386,20 @@ body:not(.tasks) li[data-task="H"].task-list-item.is-checked {
 	text-align: center;
 }
 
-/* The destination list tops out at seven rows plus four headings, so on
-   desktop it is allowed to be taller than Obsidian's default suggester before
-   it scrolls. Scoped to this popup via the class added in renderSuggestion —
-   the container is shared with every other suggester in the app.
+/* The destination list is eight rows plus four headings, so on desktop it is
+   allowed to be taller than Obsidian's default suggester before it scrolls.
+   Scoped to this popup via the class added in renderSuggestion — the container
+   is shared with every other suggester in the app.
+
+   The vh term keeps a short window from being filled edge to edge; the em term
+   is what fits the content, and it has to be raised whenever a row is added.
 
    !important is load-bearing: Obsidian sets max-height inline on the container
    while positioning the popup, and an inline style wins over a class. Which is
    exactly why this must not apply on mobile — see below. */
 body:not(.is-mobile) .suggestion-container.bujo-suggest,
 body:not(.is-mobile) .suggestion-container.bujo-suggest .suggestion {
-	max-height: 32em !important;
+	max-height: min(44em, 80vh) !important;
 }
 
 /* Day / Week / Month headings in the destination list. Inserted as siblings of

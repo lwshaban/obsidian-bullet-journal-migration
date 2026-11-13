@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { BulletJournalMigration } from '../src/bulletJournalMigration';
+import { BulletJournalMigration, MAX_REVIEW_LINE } from '../src/bulletJournalMigration';
 import { DEFAULT_SETTINGS } from '../src/settings';
 import { BujoPaths } from '../src/paths';
 import { rangeNotePaths } from '../src/reviews';
@@ -100,6 +100,55 @@ test('every entry falls in exactly one group', () => {
 	assert.equal(bujo.classifyTaskState('just prose'), null);
 	assert.equal(bujo.classifyTaskState('- [ ]'), null);
 	assert.equal(bujo.classifyTaskState('-'), null);
+});
+
+test('an entry too long to type beside is held back, not copied in', async () => {
+	// A single 240KB bullet (a pasted data URI) made a generated review take
+	// seconds per keystroke: CodeMirror re-tokenizes the whole line on each
+	// one. Held back rather than truncated — processing matches a task by its
+	// text, so a shortened copy could never be acted on.
+	const path = `${DAILY}/2026-10-30.md`;
+	const huge = `- [ ] ${'x'.repeat(MAX_REVIEW_LINE)}`;
+	const { bujo } = setup({
+		[path]: ['## Notes', '- [ ] Normal task', huge, ''].join('\n'),
+	});
+
+	const stats = { oversized: 0 };
+	assert.deepEqual(await bujo.collectTasks(path, include(), stats), ['- [ ] Normal task']);
+	assert.equal(stats.oversized, 1);
+});
+
+test('an entry right at the limit is still listed', async () => {
+	const path = `${DAILY}/2026-10-30.md`;
+	const prefix = '- [ ] ';
+	const exact = prefix + 'y'.repeat(MAX_REVIEW_LINE - prefix.length);
+	assert.equal(exact.length, MAX_REVIEW_LINE);
+
+	const { bujo } = setup({ [path]: ['## Notes', exact, ''].join('\n') });
+
+	const stats = { oversized: 0 };
+	assert.deepEqual(await bujo.collectTasks(path, include(), stats), [exact]);
+	assert.equal(stats.oversized, 0);
+});
+
+test('a review says what it held back', async () => {
+	const { bujo, vault } = setup({
+		[`${DAILY}/2026-10-30.md`]: [
+			'## Notes',
+			'- [ ] Normal task',
+			`- [ ] ${'z'.repeat(MAX_REVIEW_LINE)}`,
+			'',
+		].join('\n'),
+	});
+
+	await bujo.generateReview({ scope: { kind: 'monthly', month: '2026-10' }, include: include() });
+
+	const review = vault.files.get(`${REVIEWS}/Monthly/2026-10-Review.md`) ?? '';
+	assert.ok(review.includes('- [ ] Normal task'));
+	assert.ok(!review.includes('zzz'), 'the oversized entry is not copied in');
+	assert.match(review, /1 entry was too long to list/);
+	// A silent omission is the same failure as a silently dropped migration
+	assert.match(review, new RegExp(`over ${MAX_REVIEW_LINE} characters`));
 });
 
 test('a week covers its dailies and its weekly note, not the month', () => {
